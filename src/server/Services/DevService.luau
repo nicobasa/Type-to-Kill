@@ -415,7 +415,14 @@ end
 
 function DevService.Start()
 	Players.PlayerRemoving:Connect(onPlayerRemoving)
-	Players.PlayerAdded:Connect(publishAccess)
+
+	-- ByteNet registers this player's send channel in its own PlayerAdded
+	-- handler, connected earlier at boot -- since same-signal connections
+	-- fire newest-first, ours would run before that channel exists.
+	-- task.defer lets ByteNet's handler run first.
+	Players.PlayerAdded:Connect(function(player)
+		task.defer(publishAccess, player)
+	end)
 
 	--[[
 		GetConfigAsync yields, and throws if the config has never loaded -- hence

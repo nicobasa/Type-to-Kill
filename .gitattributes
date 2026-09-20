@@ -1,0 +1,11 @@
+# stylua.toml declares line_endings = "Unix", but this is a Windows box with
+# core.autocrlf=true globally -- without this file every checkout rewrites the
+# tree to CRLF and `stylua --check src/` can never pass, which silently disables
+# the formatting half of the quality gate (.claude/rules/quality-gate.md, Gate 1).
+#
+# Pinning eol=lf keeps the working copy matching the formatter's own config.
+* text=auto eol=lf
+
+# Roblox binary place/model files -- never touch their bytes.
+*.rbxl binary
+*.rbxm binary
