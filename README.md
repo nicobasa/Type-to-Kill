@@ -49,6 +49,7 @@ rojo sourcemap default.project.json -o sourcemap.json
 
 ## Docs
 
+- [CLAUDE.md](CLAUDE.md) — start here: the index of every rule, and what Claude loads automatically
 - [ARCHITECTURE.md](ARCHITECTURE.md) — file layout, the `Init`/`Start` lifecycle, data flow
 - [NETWORKING-AND-DATA.md](NETWORKING-AND-DATA.md) — Replica vs ByteNet, persistence, remote patterns
 - [UI-AND-MOTION.md](UI-AND-MOTION.md) — UI scaling and motion conventions
