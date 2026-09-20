@@ -1,0 +1,9 @@
+std = "roblox"
+
+# Vendored upstream source — kept byte-identical to upstream, not ours to lint.
+# See src/vendor/Replica/README.md.
+exclude = ["src/vendor/**"]
+
+[rules]
+# Rojo/Wally projects legitimately use multiple assignment on one line.
+multiple_statements = "allow"

@@ -1,0 +1,8 @@
+# Vendored upstream source — keep byte-identical so update diffs stay clean.
+# See src/vendor/Replica/README.md.
+src/vendor/
+
+# Wally-installed dependencies.
+Packages/
+ServerPackages/
+DevPackages/

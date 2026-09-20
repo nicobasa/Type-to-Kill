@@ -1,0 +1,58 @@
+{
+  "name": "Type to Kill",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "Shared": {
+        "$path": "src/shared"
+      },
+      "Packages": {
+        "$path": "Packages"
+      },
+
+      "ReplicaShared": {
+        "$path": "src/vendor/Replica/ReplicaShared"
+      },
+      "ReplicaClient": {
+        "$path": "src/vendor/Replica/ReplicaClient.luau"
+      }
+    },
+
+    "ServerScriptService": {
+      "Main": {
+        "$path": "src/server/Main.server.luau"
+      }
+    },
+
+    "ServerStorage": {
+      "Services": {
+        "$path": "src/server/Services"
+      },
+      "Modules": {
+        "$path": "src/server/Modules"
+      },
+      "ServerPackages": {
+        "$path": "ServerPackages"
+      },
+
+      "ReplicaServer": {
+        "$path": "src/vendor/Replica/ReplicaServer.luau"
+      }
+    },
+
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Main": {
+          "$path": "src/client/Main.client.luau"
+        },
+        "Controllers": {
+          "$path": "src/client/Controllers"
+        },
+        "UI": {
+          "$path": "src/client/UI"
+        }
+      }
+    }
+  }
+}

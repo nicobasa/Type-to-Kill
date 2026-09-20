@@ -1,0 +1,21 @@
+# Project place file
+/Type to Kill.rbxlx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+# Generated from default.project.json by `rojo sourcemap`
+sourcemap.json
+
+# Wally-installed dependencies (restored via `wally install`)
+/Packages
+/ServerPackages
+/DevPackages
+wally.lock
+
+# npm dependencies (this is a Wally project; guards against a wrong-directory `npm install`)
+node_modules/
+
+# Per-machine Claude Code settings (kept local, as in the sibling projects)
+.claude/settings.local.json

@@ -1,0 +1,30 @@
+[package]
+name = "gianu/typetokill"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]
+# Networking: buffer-serialised, typed, validated remotes.
+# `ffrostflame` is the author's Wally scope (`ffrostfall` on GitHub).
+# The higher-numbered `bytenet` entries in the registry are third-party forks, not upgrades.
+ByteNet = "ffrostflame/bytenet@0.4.6"
+
+# Topbar icons. `1foreverhd` is ForeverHD's own Wally scope — the other `topbarplus`
+# entries in the registry are third-party forks, not upgrades.
+# Client-only in practice, but the realm is `shared` (it must live in ReplicatedStorage
+# so a LocalScript can require it), so it belongs here rather than in server-dependencies.
+TopbarPlus = "1foreverhd/topbarplus@3.4.0"
+
+# NOTE: no motion library. Ripple (littensy/ripple) was evaluated and dropped —
+# 0.10.2 resolves its internals with `require("@self/config")` (Luau string-requires),
+# which is not reliably enabled in live Roblox servers. UI transitions use TweenService
+# directly instead; see Controllers/UIController.luau. Revisit if you outgrow it.
+
+[server-dependencies]
+# Persistence. loleris' own scope — the many other `profilestore` entries are third-party forks.
+ProfileStore = "lm-loleris/profilestore@1.0.3"
+
+# NOTE: Replica has no first-party Wally package — every registry entry is a
+# third-party fork or snapshot. It is vendored from upstream instead.
+# See src/shared/Vendor/Replica/README.md.
