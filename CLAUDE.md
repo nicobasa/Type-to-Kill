@@ -11,6 +11,7 @@ area**; do not work from this summary alone.
 |---|---|
 | File layout, the `Init`/`Start` lifecycle, data flow | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Replica vs ByteNet, persistence, remote patterns | [NETWORKING-AND-DATA.md](NETWORKING-AND-DATA.md) |
+| The match loop, codes, maps, modes, items, rewards | [GAMEPLAY.md](GAMEPLAY.md) |
 | UI scaling and motion | [UI-AND-MOTION.md](UI-AND-MOTION.md) |
 | Verification you must pass before saying "done" | [.claude/rules/quality-gate.md](.claude/rules/quality-gate.md) |
 | Instance naming | [.claude/rules/model-naming-style.md](.claude/rules/model-naming-style.md) |
@@ -84,14 +85,52 @@ construct UI trees in Luau that belong in StarterGui.
 ## Verifying your work
 
 Full gate list and when each applies: [.claude/rules/quality-gate.md](.claude/rules/quality-gate.md).
-The commands below are the ones this project actually uses — all three pass on
-a clean tree, so a failure is yours:
+The first three pass on a clean tree, so a failure there is yours:
 
 ```powershell
 selene src/                                     # 0 errors, 0 warnings
 stylua --check src/                             # never reformat as a side effect
 rojo build default.project.json -o "$env:TEMP/out.rbxlx"
+
+# Types. None of the three above look at types -- a build only proves it parses.
+rojo sourcemap default.project.json -o sourcemap.json
+luau-lsp analyze --definitions=globalTypes.d.luau --sourcemap=sourcemap.json `
+  --base-luaurc=.luaurc --ignore="src/vendor/**" src/
 ```
+
+**`luau-lsp` passes with exactly one known exception**, so treat any other
+diagnostic as yours:
+
+- *"Cyclic dependencies are only supported if all modules use 'export' syntax"* —
+  60 lines of it, and every one is the deferred-require pattern ARCHITECTURE.md
+  prescribes. It is correct at runtime (the annotation is erased); `luau-lsp`
+  cannot see that. This is the whole baseline.
+- Anything under `src/vendor/` is excluded by `--ignore`, as it is in
+  `selene.toml` and `.styluaignore`.
+
+Quick check that you added nothing:
+
+```powershell
+luau-lsp analyze --definitions=globalTypes.d.luau --sourcemap=sourcemap.json `
+  --base-luaurc=.luaurc --ignore="src/vendor/**" src/ |
+  Select-String -NotMatch "Cyclic dependencies"   # expect no output
+```
+
+Two traps worth knowing before you "fix" a diagnostic, both of which cost real
+time to learn:
+
+- **A `{[K]: V}` read is typed `V`, not `V?`.** So `if map[key] == nil then` is
+  reported as comparing non-nil with nil. The check is almost always correct and
+  load-bearing; the honest fix is declaring the table `{[K]: V?}` or annotating
+  the local. **Deleting the nil check is a crash.** The same shape shows up on
+  `Player.Team`, which really is nil for an unassigned player whatever
+  `globalTypes.d.luau` says.
+- **A scalar assigned to a module table widens.** `Match.X = "A" :: SomeUnion`
+  reaches every reader as plain `string`, and assigning from an annotated local
+  does not help either. Both were measured. What works is declaring the field
+  inside the table constructor (`local Match = { X = "A" :: SomeUnion }`),
+  which keeps its type. `Match.DEFAULT_MODE` is written that way for this
+  reason. Array casts (`:: { T }`) are not affected.
 
 Write build artifacts to the temp dir, never into the repo. This is a Windows
 box — don't use `/tmp`.

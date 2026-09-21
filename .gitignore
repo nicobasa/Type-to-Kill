@@ -8,6 +8,11 @@
 # Generated from default.project.json by `rojo sourcemap`
 sourcemap.json
 
+# Roblox API type definitions for luau-lsp. Fetched, not authored, and they go
+# stale as Roblox ships API changes -- so they are re-downloaded rather than
+# committed. See README.md "Setup".
+globalTypes.d.luau
+
 # Wally-installed dependencies (restored via `wally install`)
 /Packages
 /ServerPackages

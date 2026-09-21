@@ -36,7 +36,28 @@ StarterGui
             └── Root
 ```
 
-That is the whole setup. It registers itself when PlayerGui populates.
+That is the whole setup. It registers itself once the folder reaches PlayerGui.
+
+### How it reaches PlayerGui, and why that is not automatic here
+
+Normally the engine copies StarterGui into PlayerGui **when a character spawns**. This
+game never spawns one on join — `ParticipantService` sets `Players.CharacterAutoLoads =
+false` so a player lands in the main menu, not in the world. No character, no copy, no UI.
+
+So `UIController.Init` clones `StarterGui.Screens` into PlayerGui itself. Two things make
+that safe rather than a race:
+
+- `StarterGui.ResetPlayerGuiOnSpawn` is **off**, and with it off the engine does not do
+  the copy on a later spawn either — so there is never a second `Screens` folder. This was
+  verified in a Studio session, not assumed: with a folder already present,
+  `LoadCharacter()` left the count at one.
+- Screens are addressed by name and register themselves, so even if a copy did arrive
+  later, `register()` rebinds rather than breaking.
+
+**If you ever turn `ResetPlayerGuiOnSpawn` back on**, the engine will wipe PlayerGui and
+re-clone on every respawn — including over this clone. It recovers, but every screen also
+reverts to its authored `Enabled` state on each death, which reads to a player as "the
+menu closed itself". Leave it off.
 
 ### Properties, on the ScreenGui
 

@@ -227,7 +227,10 @@ function Transitions.begin(root: GuiObject, name: Name): Pose
 	end
 	entry.originals = originals
 
-	local offset = SLIDE_OFFSETS[name]
+	-- Annotated optional because a `{ [string]: T }` read is typed T, not T?:
+	-- only the slide poses have an offset, and the nil test below is how the
+	-- non-slide ones fall through to the scale branch.
+	local offset: Vector2? = SLIDE_OFFSETS[name]
 	local scaled = name == "Scale"
 
 	return function(alpha: number)

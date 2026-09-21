@@ -25,6 +25,35 @@ The rule, and it is a rule:
 
 The honest test: *"if this packet never arrives, is the client wrong, or just less informed?"* Wrong → Replica. Less informed → ByteNet.
 
+## There are two replicas, and they are opposites
+
+| | `PlayerData` (`DataService`) | `MatchState` (`RoundService`) |
+|---|---|---|
+| Holds | one player's profile | the whole server's round |
+| Sent with | `:Subscribe(player)` — that player only | `:Replicate()` — everyone, present and future |
+| Backed by | ProfileStore; survives a rejoin | nothing; dies with the server |
+| Read on the client through | `DataController.observe` | `MatchController.observe` |
+
+The round is a replica rather than a stream of packets for exactly the reason above: a
+player who joins eight minutes into a round needs the timer, the mode, the scores and the
+scoreboard, and an event they were not present for cannot give them any of it.
+`:Replicate()` subscribes future players automatically, so a late joiner and a founding
+player take the identical code path.
+
+Two rules that only apply to the public one:
+
+- **`:Replicate()` means everyone.** Nothing secret may be added to it. Four-digit codes
+  are deliberately not in it — see [GAMEPLAY.md](GAMEPLAY.md).
+- **One writer.** `RoundService` is the only file that calls a setter on it; everything
+  else asks it to write (`writePlayer`, `writeScores`, `writeVote`). Nine services each
+  `Set()`ing into a shared table is a shape nobody can review in one place.
+
+> **The `OnSet` trap, again.** `RoundService` writes `State` and `PhaseEndsAt` together in
+> one `SetValues`, and `SetValues` fires **only** `OnChange` — never `OnSet`. So
+> `replica:OnSet({"State"}, ...)` would never fire for a phase change. This is the same
+> hazard `observe` exists to remove, which is why `MatchController.observe` is built on
+> `OnChange` like `DataController.observe`. Use the observer; do not reach for `OnSet`.
+
 ---
 
 # Part 1 — Server fires an event to the client

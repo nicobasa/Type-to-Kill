@@ -63,7 +63,10 @@ function Motion.info(preset: Preset | TweenInfo): TweenInfo
 		return preset
 	end
 
-	local info = PRESETS[preset]
+	-- Annotated optional because a `{ [string]: T }` read is typed T, not T?,
+	-- so the checker would reject the nil test below. The test is the point of
+	-- this function -- `preset` can be any string off a Studio attribute.
+	local info: TweenInfo? = PRESETS[preset]
 	if info == nil then
 		log.warn(`unknown preset "{preset}" -- using "smooth"`)
 		return PRESETS.smooth

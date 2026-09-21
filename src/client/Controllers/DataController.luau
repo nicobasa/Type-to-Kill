@@ -125,8 +125,8 @@ end
 	binding is one call with no "connect, then also read once" boilerplate, and
 	no first frame showing the Studio placeholder text.
 
-		DataController.observe({"Coins"}, function(coins)
-			label.Text = `{coins}`
+		DataController.observe({"Cash"}, function(cash)
+			label.Text = `{cash}`   -- fires now AND on every change
 		end)
 
 	Built on OnChange, NOT OnSet, and that is load-bearing. OnSet is keyed on an

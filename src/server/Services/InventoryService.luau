@@ -5,7 +5,7 @@
 	There is no item catalog and no set(). Any string is a legal id provided
 	its SHAPE is legal (Validate.itemId) -- the shape rules are not politeness,
 	they are what keeps Inventory replicable at all. Counts change only by
-	delta, for the same reason CoinsService has no set(): an absolute setter is
+	delta, for the same reason CashService has no set(): an absolute setter is
 	only safe if every caller, forever, avoids yielding between reading the
 	count and writing it back -- an invariant nothing enforces. add()/tryRemove()
 	do the read-compute-write inside themselves in one yield-free slice, so that

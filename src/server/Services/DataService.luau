@@ -38,24 +38,58 @@ local log = Log.new("DataService")
 	WARNING (from Replica's own docs): no gaps in numeric tables, and no keys
 	that aren't strings or numbers. Those cannot be replicated.
 ]]
-local DATA_VERSION = 1
+local DATA_VERSION = 2
 
 local TEMPLATE = {
 	Version = DATA_VERSION,
-	Coins = 0,
+	--[[
+		The currency, named for what the game calls it on screen. It was
+		`Coins` in v1; see MIGRATIONS below for why that rename needed a
+		version bump and a one-time move rather than just editing this line.
+	]]
+	Cash = 0,
 	Level = 1,
 	Experience = 0,
 	-- Nested tables are fine -- this is the whole reason Replica exists.
 	Inventory = {} :: { [string]: number },
 	Settings = {
 		MusicEnabled = true,
+		--[[
+			Accessibility, and the reason it is a persisted setting rather than
+			a client-side toggle: a player who needs the dark flash needs it on
+			every device and every session, and a preference that has to be
+			re-set after each rejoin is one that fails exactly the people it
+			exists for. Default false -- the white flash is the designed effect;
+			this replaces it, it is not a lesser mode.
+		]]
+		DarkFlashEffect = false,
 	},
 }
 
 export type PlayerData = typeof(TEMPLATE)
 
--- Index N migrates version N -> N+1. Never delete or renumber one.
-local MIGRATIONS: { (data: any) -> () } = {}
+--[[
+	Index N migrates version N -> N+1. Never delete or renumber one.
+
+	v1 -> v2 renames Coins to Cash. Reconcile() could not do this alone: it
+	only ADDS missing keys (ARCHITECTURE.md, "Adding vs. reshaping"), so
+	without this step every existing player would have been handed a brand new
+	Cash = 0 while their real balance sat in an orphaned Coins key, draining
+	DataStore bytes forever and looking exactly like a wipe from the player's
+	side.
+
+	`or 0` rather than a bare copy: a v0 profile predating the Version field
+	has no Coins either, and arithmetic on nil here would abort the load for
+	that player and kick them.
+]]
+local MIGRATIONS: { (data: any) -> () } = {
+	[1] = function(data)
+		data.Cash = data.Coins or 0
+		-- Delete the old key. Leaving it costs space in a 4MB-capped profile
+		-- and leaves two plausible answers to "what is their balance?".
+		data.Coins = nil
+	end,
+}
 
 local PROFILE_STORE_NAME = "PlayerData_v1"
 
@@ -204,7 +238,7 @@ end
 
 --[[
 	THE WRITE PATH. Every mutation goes through a replica setter -- never touch
-	profile.Data directly. A raw `profile.Data.Coins = 5` mutates the table but
+	profile.Data directly. A raw `profile.Data.Cash = 5` mutates the table but
 	sends nothing, so the client silently drifts out of sync. The setters are
 	the only thing that both mutate and replicate.
 

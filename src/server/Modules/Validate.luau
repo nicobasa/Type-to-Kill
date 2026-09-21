@@ -1,7 +1,7 @@
 --!strict
 --[[
 	The shared validation ladder for every "amount" and "item id" a mutating
-	service function accepts. CoinsService, InventoryService and LevelService
+	service function accepts. CashService, InventoryService and LevelService
 	each call in here before touching a byte of profile data -- three
 	implementers writing this ladder independently is exactly how you end up
 	with three subtly different NaN checks, which is the failure this module
@@ -107,6 +107,55 @@ function Validate.itemId(id: string): boolean
 		return false
 	end
 	return true
+end
+
+--[[
+	True only for a kill code: EXACTLY `digits` characters, every one of them
+	an ASCII digit.
+
+	The pattern is anchored at both ends and quantified exactly -- `^%d+$`
+	would accept "12345678", and `%d%d%d%d` unanchored would accept
+	"abc1234xyz". Both would then be looked up in the code table, where a
+	near-miss quietly matching a real code is the difference between a fair
+	kill and a free one.
+
+	Length is checked before the pattern so a megabyte-long string from a
+	crafted packet is rejected by an integer comparison rather than by running
+	a pattern match over all of it.
+
+	The pattern is BUILT by repetition, not written with a count. Lua patterns
+	have no `{n}` quantifier -- `^%d{4}$` is not "four digits", it is "a digit,
+	then a literal {, then a 4, then a literal }", which matches nothing and
+	would reject every code in the game while looking entirely correct.
+
+	A CODE IS A STRING, ALWAYS. Nothing in this codebase may put a code
+	through tonumber(): "0047" and 47 are the same number and different codes,
+	and the leading zeros are the whole reason a player can read one off a
+	headband at a glance. That is also why this takes a string and has no
+	numeric overload to reach for.
+]]
+-- Built once per distinct `digits`. There is exactly one in practice
+-- (Config.Code.Digits), so this is a one-entry table, not a cache that grows.
+local codePatterns: { [number]: string } = {}
+
+function Validate.code(code: string, digits: number): boolean
+	if type(code) ~= "string" then
+		return false
+	end
+	if type(digits) ~= "number" or digits ~= digits or digits < 1 or math.floor(digits) ~= digits then
+		return false
+	end
+	if #code ~= digits then
+		return false
+	end
+
+	local pattern = codePatterns[digits]
+	if pattern == nil then
+		pattern = `^{string.rep("%d", digits)}$`
+		codePatterns[digits] = pattern
+	end
+
+	return string.match(code, pattern) ~= nil
 end
 
 return Validate

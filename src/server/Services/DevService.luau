@@ -194,7 +194,7 @@ end
 	NaN defeats a naive range check (n < 0 or n > MAX passes for 0/0), so it's
 	rejected explicitly -- quality-gate.md trap #8. math.huge is rejected too:
 	DataService.set would happily replicate it, and there is no sane save/load
-	round trip for an infinite Coins.
+	round trip for an infinite Cash.
 ]]
 local function parseValue(kind: string, raw: string): (boolean, any)
 	if kind == "number" then

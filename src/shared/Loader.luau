@@ -141,7 +141,7 @@ local function runStart(entry: Entry)
 
 	-- Spawned, so one slow Start never blocks another.
 	task.spawn(function()
-		local ok, err = xpcall(start, debug.traceback)
+		local ok: boolean, err: string? = xpcall(start, debug.traceback)
 		if not ok then
 			log.error(`{entry.name}.Start() errored: {err}`)
 		end

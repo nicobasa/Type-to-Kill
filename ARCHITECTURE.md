@@ -13,7 +13,10 @@
 | `src/shared/` | → `ReplicatedStorage.Shared`. Only what both sides need. | **No — Rojo overwrites** |
 | `src/vendor/Replica/` | → `ReplicatedStorage.ReplicaShared` + `.ReplicaClient`, `ServerStorage.ReplicaServer` | **No — vendored** |
 | `Packages/`, `ServerPackages/` | Wally-installed. Gitignored. | **No — `wally install` regenerates** |
-| **Everything else in Studio** | GUIs, models, Workspace, Lighting | **Yes — this is yours** |
+| `StarterGui.Screens/` | Every ScreenGui. Code finds and drives them; it never builds one. | **Yes — this is yours** |
+| `ServerStorage.Maps/` | The six map models. Spawns, pickup nodes and camera rails are found **by tag** (`Shared.Tags`), never by name or coordinate. | **Yes — this is yours** |
+| `ServerStorage.Assets/` | Headband, grenade bodies, pickup marker. | **Yes — this is yours** |
+| **Everything else in Studio** | models, Workspace, Lighting | **Yes — this is yours** |
 
 Scripts live in VS Code. Instances live in Studio. Rojo mounts only scripts, so it never fights your Lighting or your GUI tree.
 

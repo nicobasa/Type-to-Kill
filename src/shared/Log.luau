@@ -21,6 +21,9 @@ export type Logger = {
 	error: (message: string) -> (),
 }
 
+-- Keyed by the Level union, so a constant lookup must be written
+-- LEVEL_ORDER["warn" :: Level]: `.warn` is a named-property lookup the indexer
+-- does not satisfy, and a bare "warn" widens to `string` before it gets here.
 local LEVEL_ORDER: { [Level]: number } = {
 	debug = 10,
 	info = 20,
@@ -44,7 +47,7 @@ local function shouldEmit(level: Level, tag: string): boolean
 	end
 	if tagFilter ~= nil and tagFilter[tag] ~= true then
 		-- Errors ignore the tag filter; you always want to see those.
-		return LEVEL_ORDER[level] >= LEVEL_ORDER.error
+		return LEVEL_ORDER[level] >= LEVEL_ORDER["error" :: Level]
 	end
 	return true
 end
@@ -58,7 +61,7 @@ local function emit(level: Level, tag: string, message: string)
 
 	-- warn() routes to stderr: yellow in Studio, and captured by Roblox's
 	-- error analytics in production. Never print() a problem.
-	if LEVEL_ORDER[level] >= LEVEL_ORDER.warn then
+	if LEVEL_ORDER[level] >= LEVEL_ORDER["warn" :: Level] then
 		warn(line)
 	else
 		print(line)
