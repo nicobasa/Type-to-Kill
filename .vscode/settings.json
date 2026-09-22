@@ -1,0 +1,15 @@
+{
+	// Third-party code is not ours to fix: Wally packages are reinstalled by
+	// `wally install` (any edit is lost) and src/vendor is byte-identical to
+	// upstream. The project's .luaurc puts everything in strict mode, which
+	// those files were never written for, so the editor would flag them with
+	// diagnostics that are not real problems. Same exclusions as the CLI gate
+	// (`--ignore="src/vendor/**"` in CLAUDE.md) and selene.toml.
+	"luau-lsp.ignoreGlobs": [
+		"**/_Index/**",
+		"Packages/**",
+		"ServerPackages/**",
+		"DevPackages/**",
+		"src/vendor/**"
+	]
+}

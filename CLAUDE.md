@@ -171,3 +171,11 @@ rokit install    # pinned toolchain — versions live in rokit.toml
 wally install    # restores Packages/ and ServerPackages/ (gitignored)
 rojo serve       # then: Rojo plugin → Connect, in Studio
 ```
+
+Package code is third-party and is never fixed in place, since `wally install` would undo
+it. The root `.luaurc` is strict, which packages were not written for.
+`.vscode/settings.json` (`luau-lsp.ignoreGlobs`) keeps their diagnostics out of the
+editor's Explorer and Problems panel. A `.luaurc` of
+`{"languageMode": "nocheck", "lint": {"*": false}}` in `Packages/` and `ServerPackages/`
+also keeps a package file clean while it is open. `wally install` wipes those two
+`.luaurc` files, so recreate them afterwards if you want that. Rojo ignores them.
