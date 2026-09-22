@@ -1,8 +1,9 @@
 --!strict
 --[[
-	The fifteen-second ballot: which map, and which mode.
+	The fifteen-second ballot: which map, which game mode (the ruleset), and
+	which team mode.
 
-	Two votes run side by side and a player holds at most one of each. Voting
+	Three votes run side by side and a player holds at most one of each. Voting
 	again MOVES that player's vote rather than adding a second -- which is why
 	the votes live in {[Player]: choice} tables rather than in counters. A
 	counter cannot express "move": to undo the previous vote it has to be told
@@ -61,35 +62,52 @@ local log = Log.new("VoteService")
 local random = Random.new()
 
 --[[
-	One limiter per ballot, both on Config.RateLimit.Vote. Sharing a single one
-	would make the two votes interfere: picking a map and then a mode is the
-	normal way a player fills this screen in, and those two clicks land well
-	inside 250ms of each other, so a shared floor would silently drop the
-	second one and the player would watch their mode vote fail to register.
+	One limiter per ballot, all on Config.RateLimit.Vote. Sharing a single one
+	would make the votes interfere: picking a map, then a game mode, then a
+	team mode is the normal way a player fills this screen in, and those clicks
+	land well inside 250ms of each other, so a shared floor would silently drop
+	the second one and the player would watch their vote fail to register.
 	That is the "limit a real player can feel" Config.luau warns against, and
 	it buys nothing -- a flooder is still bounded per packet kind, and each
 	dropped packet still costs a table lookup and nothing else.
 ]]
 local mapVoteLimit = RateLimiter.new(Config.RateLimit.Vote)
-local modeVoteLimit = RateLimiter.new(Config.RateLimit.Vote)
 
 --[[
-	The mode ballot never changes, so it is built once rather than per round.
+	The two mode ballots, which share a shape: a fixed list of options that
+	never changes between rounds, one vote per player, and a tally published
+	under its own key in the round replica's Vote table.
 
-	It is Match.MODE_ORDER (a list, because a dictionary has no order and "the
-	mode buttons moved between rounds" is a real bug from iterating one) capped
-	at Config.Voting.MaxModeChoices, which is how many columns the vote panel
-	has. A fourth mode past that cap would be one the server happily accepts
-	votes for and no player can see to vote for, so the cap is applied to the
-	ballot the SERVER enforces too, not just to the UI.
+	Options come from Match's *_ORDER lists (lists, because a dictionary has no
+	order and "the mode buttons moved between rounds" is a real bug from
+	iterating one). The client builds the same lists from the same source, so
+	the server and the panel always offer the same options.
+
+	Stored as strings. Every value that gets in is matched against `options`
+	first, so it is always a real id; getResult restates the type with one
+	cast per ballot, and RoundService re-checks it with Match.is*Id anyway.
 ]]
-local MODE_BALLOT: { Match.GameModeId } = {}
-for index = 1, math.min(Config.Voting.MaxModeChoices, #Match.MODE_ORDER) do
-	table.insert(MODE_BALLOT, Match.MODE_ORDER[index])
-end
-if #MODE_BALLOT < #Match.MODE_ORDER then
-	log.warn(`{#Match.MODE_ORDER - #MODE_BALLOT} mode(s) off the ballot -- MaxModeChoices is {#MODE_BALLOT}`)
-end
+type ModeBallot = {
+	options: { string },
+	votes: { [Player]: string },
+	limit: RateLimiter.Limiter,
+	-- The key in Round.Vote this ballot's tally is published under.
+	tallyKey: string,
+}
+
+local gameModeBallot: ModeBallot = {
+	options = table.clone(Match.GAME_MODE_ORDER) :: { any },
+	votes = {},
+	limit = RateLimiter.new(Config.RateLimit.Vote),
+	tallyKey = "GameModeVotes",
+}
+
+local teamModeBallot: ModeBallot = {
+	options = table.clone(Match.TEAM_MODE_ORDER) :: { any },
+	votes = {},
+	limit = RateLimiter.new(Config.RateLimit.Vote),
+	tallyKey = "TeamModeVotes",
+}
 
 local VoteService = {}
 
@@ -98,13 +116,16 @@ local VoteService = {}
 local mapChoices: { string } = {}
 
 local mapVotes: { [Player]: string } = {}
-local modeVotes: { [Player]: Match.GameModeId } = {}
 
 local accepting = false
 
 -- The frozen result, nil until endVote() computes it. See the header.
-local resolvedMapId: string? = nil
-local resolvedModeId: Match.GameModeId? = nil
+type Result = {
+	mapId: string,
+	gameModeId: Match.GameModeId,
+	teamModeId: Match.TeamModeId,
+}
+local resolved: Result? = nil
 
 --[[
 	Config.Voting.MapChoices DISTINCT maps.
@@ -142,38 +163,34 @@ local function pickMapChoices(): { string }
 end
 
 --[[
-	Both ballots seed every option at zero and count only votes for options
+	Every ballot seeds every option at zero and counts only votes for options
 	still on offer. Seeding matters: the panel draws a row per key, so a tally
 	that gains its keys as votes arrive is a panel whose rows appear one at a
 	time. Skipping unknown options matters for the mirror reason -- a key the
 	client has no card for is a row it cannot draw.
 ]]
-local function tallyMaps(): { [string]: number }
-	local counts: { [string]: number } = {}
-	for _, mapId in mapChoices do
-		counts[mapId] = 0
+local function tally(options: { string }, votes: { [Player]: string }): { [string]: number }
+	-- Annotated optional: a read of an option nobody seeded is genuinely nil,
+	-- and the nil check below is what skips it (CLAUDE.md, the {[K]: V} trap).
+	local counts: { [string]: number? } = {}
+	for _, option in options do
+		counts[option] = 0
 	end
-	for _, mapId in mapVotes do
-		local current = counts[mapId]
+	for _, choice in votes do
+		local current = counts[choice]
 		if current ~= nil then
-			counts[mapId] = current + 1
+			counts[choice] = current + 1
 		end
 	end
-	return counts
+	return counts :: { [string]: number }
 end
 
-local function tallyModes(): { [string]: number }
-	local counts: { [string]: number } = {}
-	for _, modeId in MODE_BALLOT do
-		counts[modeId] = 0
-	end
-	for _, modeId in modeVotes do
-		local current = counts[modeId]
-		if current ~= nil then
-			counts[modeId] = current + 1
-		end
-	end
-	return counts
+local function tallyMaps(): { [string]: number }
+	return tally(mapChoices, mapVotes)
+end
+
+local function publishModeBallot(ballot: ModeBallot)
+	RoundService.writeVote({ [ballot.tallyKey] = tally(ballot.options, ballot.votes) })
 end
 
 --[[
@@ -217,29 +234,24 @@ local function resolveWinner<T>(ballot: { T }, cast: { [Player]: T }): T?
 	return tied[random:NextInteger(1, #tied)]
 end
 
-local function resolve(): (string, Match.GameModeId)
-	-- MODE_BALLOT is empty only if Match.MODE_ORDER is, which the type system
-	-- cannot rule out and which would otherwise leave the round with no mode.
-
+local function resolve(): Result
 	--[[
-		Every local below is annotated because an inferred one widens
-		GameModeId's two singletons to plain `string`, and the return promises
-		the union. The cast restates a contract that already holds; it does not
-		stand in for a check.
-
-		resolveWinner returns an element of the ballot it was handed and nothing
-		else, and MODE_BALLOT is `{ GameModeId }` by construction. Luau still
-		widens GameModeId's two singletons to `string` across the generic --
-		instantiating `T` into a fresh `{ T }` loses literal types (verified
-		against luau-lsp on a four-line reduction of resolveWinner).
+		Every local below is annotated because an inferred one widens the
+		mode unions' singletons to plain `string`, and the Result promises the
+		unions. The casts restate a contract that already holds -- every option
+		on a mode ballot is an id from Match's ORDER list, and resolveWinner
+		returns one of the options it was handed and nothing else -- they do
+		not stand in for a check. A ballot is empty only if its ORDER list is,
+		which falls back to the default.
 	]]
-	local fallbackMode: Match.GameModeId = Match.DEFAULT_MODE
-	local winner: Match.GameModeId? = resolveWinner(MODE_BALLOT, modeVotes) :: Match.GameModeId?
-	local modeId: Match.GameModeId = winner or fallbackMode
+	local gameWinner: Match.GameModeId? = resolveWinner(gameModeBallot.options, gameModeBallot.votes) :: any
+	local gameModeId: Match.GameModeId = gameWinner or Match.DEFAULT_GAME_MODE
+	local teamWinner: Match.TeamModeId? = resolveWinner(teamModeBallot.options, teamModeBallot.votes) :: any
+	local teamModeId: Match.TeamModeId = teamWinner or Match.DEFAULT_TEAM_MODE
 
 	local mapId = resolveWinner(mapChoices, mapVotes)
 	if mapId ~= nil then
-		return mapId, modeId
+		return { mapId = mapId, gameModeId = gameModeId, teamModeId = teamModeId }
 	end
 
 	--[[
@@ -251,10 +263,14 @@ local function resolve(): (string, Match.GameModeId)
 	]]
 	if #MapCatalog.LIST == 0 then
 		log.error("MapCatalog.LIST is empty -- there is no map to resolve to")
-		return "", modeId
+		return { mapId = "", gameModeId = gameModeId, teamModeId = teamModeId }
 	end
 	log.warn("resolving with no ballot -- beginVote() was never called for this round")
-	return MapCatalog.LIST[random:NextInteger(1, #MapCatalog.LIST)].Id, modeId
+	return {
+		mapId = MapCatalog.LIST[random:NextInteger(1, #MapCatalog.LIST)].Id,
+		gameModeId = gameModeId,
+		teamModeId = teamModeId,
+	}
 end
 
 --[[
@@ -298,34 +314,22 @@ local function onVoteMap(data: { mapId: string }, player: Player)
 	RoundService.writeVote({ MapVotes = tallyMaps() })
 end
 
-local function onVoteMode(data: { modeId: string }, player: Player)
-	if not modeVoteLimit.allow(player) then
+local function onVoteModeBallot(ballot: ModeBallot, modeId: string, player: Player)
+	if not ballot.limit.allow(player) then
 		return
 	end
 	if not isOpen() then
 		return
 	end
 
-	--[[
-		Matched against the ballot by iteration rather than table.find so the
-		value stored is the one FROM MODE_BALLOT: it is a GameModeId by
-		construction, where the packet's field is only a string. That keeps the
-		mode a typed value all the way to getResult with no cast standing in
-		for a check.
-	]]
-	local chosen: Match.GameModeId? = nil
-	for _, modeId: Match.GameModeId in MODE_BALLOT do
-		if modeId == data.modeId then
-			chosen = modeId
-			break
-		end
-	end
-	if chosen == nil or modeVotes[player] == chosen then
+	-- ByteNet proved this is a string. That it is an option on THIS ballot is
+	-- ours to prove, or a crafted packet elects a mode nobody was shown.
+	if table.find(ballot.options, modeId) == nil or ballot.votes[player] == modeId then
 		return
 	end
 
-	modeVotes[player] = chosen
-	RoundService.writeVote({ ModeVotes = tallyModes() })
+	ballot.votes[player] = modeId
+	publishModeBallot(ballot)
 end
 
 local function onPlayerRemoving(player: Player)
@@ -337,21 +341,21 @@ local function onPlayerRemoving(player: Player)
 		ever been in the server.
 	]]
 	local hadMapVote = mapVotes[player] ~= nil
-	local hadModeVote = modeVotes[player] ~= nil
 	mapVotes[player] = nil
-	modeVotes[player] = nil
 
 	-- Republish only what actually moved, and only while a ballot is live --
 	-- after the close the published tallies are a finished result the results
 	-- panel may still be showing, and the cleared tables would zero it.
-	if not accepting then
-		return
-	end
-	if hadMapVote then
+	if accepting and hadMapVote then
 		RoundService.writeVote({ MapVotes = tallyMaps() })
 	end
-	if hadModeVote then
-		RoundService.writeVote({ ModeVotes = tallyModes() })
+
+	for _, ballot in { gameModeBallot, teamModeBallot } do
+		local hadVote = ballot.votes[player] ~= nil
+		ballot.votes[player] = nil
+		if accepting and hadVote then
+			publishModeBallot(ballot)
+		end
 	end
 end
 
@@ -366,15 +370,15 @@ end
 function VoteService.beginVote()
 	mapChoices = pickMapChoices()
 	table.clear(mapVotes)
-	table.clear(modeVotes)
-	resolvedMapId = nil
-	resolvedModeId = nil
+	table.clear(gameModeBallot.votes)
+	table.clear(teamModeBallot.votes)
+	resolved = nil
 	accepting = true
 
 	--[[
-		One write, all three fields: the panel needs the choices and both
-		tallies to draw anything, and three separate writes would let it draw
-		twice from a half-built vote table.
+		One write, every field: the panel needs the choices and all three
+		tallies to draw anything, and separate writes would let it draw from a
+		half-built vote table.
 
 		MapChoices is a CLONE. A Replica holds the table it is handed rather
 		than a copy of it (DataService.luau's note on `Data = profile.Data`), so
@@ -384,7 +388,8 @@ function VoteService.beginVote()
 	RoundService.writeVote({
 		MapChoices = table.clone(mapChoices),
 		MapVotes = tallyMaps(),
-		ModeVotes = tallyModes(),
+		[gameModeBallot.tallyKey] = tally(gameModeBallot.options, gameModeBallot.votes),
+		[teamModeBallot.tallyKey] = tally(teamModeBallot.options, teamModeBallot.votes),
 	})
 end
 
@@ -405,26 +410,26 @@ function VoteService.endVote()
 	end
 	accepting = false
 
-	if resolvedMapId == nil or resolvedModeId == nil then
-		resolvedMapId, resolvedModeId = resolve()
+	if resolved == nil then
+		resolved = resolve()
 	end
 
 	table.clear(mapVotes)
-	table.clear(modeVotes)
+	table.clear(gameModeBallot.votes)
+	table.clear(teamModeBallot.votes)
 end
 
 --[[
-	The winning map id and mode id. Random among the tied options only.
+	The winning map id, game mode id and team mode id. Random among the tied
+	options only.
 ]]
-function VoteService.getResult(): (string, Match.GameModeId)
-	if resolvedMapId ~= nil and resolvedModeId ~= nil then
-		return resolvedMapId, resolvedModeId
+function VoteService.getResult(): (string, Match.GameModeId, Match.TeamModeId)
+	local frozen = resolved
+	if frozen ~= nil then
+		return frozen.mapId, frozen.gameModeId, frozen.teamModeId
 	end
 
-	-- Annotated for the same reason resolve() annotates its own: an inferred
-	-- local drops GameModeId back to a widened string, and the freeze below
-	-- writes it into resolvedModeId, which is typed.
-	local mapId: string, modeId: Match.GameModeId = resolve()
+	local result = resolve()
 
 	--[[
 		Freeze on the FIRST ask that lands after the vote stopped being open,
@@ -439,10 +444,10 @@ function VoteService.getResult(): (string, Match.GameModeId)
 		legitimately change -- that is what makes it the wrong one to keep.
 	]]
 	if not isOpen() then
-		resolvedMapId, resolvedModeId = mapId, modeId
+		resolved = result
 	end
 
-	return mapId, modeId
+	return result.mapId, result.gameModeId, result.teamModeId
 end
 
 --[[
@@ -462,9 +467,15 @@ function VoteService.Init()
 		end
 	end)
 
-	Net.voteMode.listen(function(data, player)
+	Net.voteGameMode.listen(function(data, player)
 		if player ~= nil then
-			onVoteMode(data, player)
+			onVoteModeBallot(gameModeBallot, data.modeId, player)
+		end
+	end)
+
+	Net.voteTeamMode.listen(function(data, player)
+		if player ~= nil then
+			onVoteModeBallot(teamModeBallot, data.modeId, player)
 		end
 	end)
 

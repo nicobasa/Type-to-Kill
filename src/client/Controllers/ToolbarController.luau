@@ -32,6 +32,17 @@
 	    into a flag here, because TypeMode closes for reasons this controller
 	    never hears about -- a death, a round ending.
 
+	THROWING IS CHARGED
+
+	Pressing the throw input with something in hand starts a charge; releasing
+	throws it. How long it was held, over Config.Throw.ChargeTime, is the
+	`charge` the packet carries (0 = a quick tap, 1 = a full second), and the
+	server turns it into the launch speed. While charging, HUD.Root.ChargeBar
+	beside the crosshair fills -- shown only after Config.Throw.BarDelay, so a
+	quick tap never flashes it. A charge is dropped, not thrown, if anything
+	takes the hand away first: a slot change, the item going, the phase ending,
+	or TypeMode opening.
+
 	THE HUD IS RE-FOUND ON EVERY RESPAWN
 
 	StarterGui.ResetPlayerGuiOnSpawn wipes and re-clones PlayerGui when the
@@ -45,6 +56,8 @@ local CollectionService = game:GetService("CollectionService")
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
 local Binds = require(script.Parent.Parent.UI.Binds)
 local CameraController = require(script.Parent.CameraController)
@@ -110,6 +123,18 @@ local slotViews: { SlotView } = {}
 local mobileControls: GuiObject? = nil
 local throwButton: GuiButton? = nil
 local dropButton: GuiButton? = nil
+
+-- HUD.Root.ChargeBar and its Fill, on the current HUD copy. Optional: without
+-- them a charge still works, it just is not drawn.
+local chargeBar: GuiObject? = nil
+local chargeFill: GuiObject? = nil
+-- os.clock() the current charge began, or nil when not charging.
+local chargeStartedAt: number? = nil
+-- The touch that started a charge on the ThrowButton; its end is the release.
+local chargeTouch: InputObject? = nil
+local chargeConnection: RBXScriptConnection? = nil
+-- Forward declared: selection (above the charging section) drops a charge.
+local cancelCharge: () -> ()
 
 -- Everything bound to the CURRENT PlayerGui copy of the HUD, dropped as a
 -- batch when that copy is replaced. Destroying the screen would disconnect
@@ -344,6 +369,8 @@ local function setSelectedSlot(slot: number)
 	end
 
 	selectedSlot = slot
+	-- A charge belongs to the item that was in hand when it began.
+	cancelCharge()
 	redraw()
 
 	--[[
@@ -357,7 +384,7 @@ end
 
 -- Both return whether a packet actually went out, which is what decides
 -- between sinking the input and passing it on.
-local function throwSelected(): boolean
+local function throwSelected(charge: number): boolean
 	if not inputAllowed() then
 		return false
 	end
@@ -391,8 +418,81 @@ local function throwSelected(): boolean
 		return false
 	end
 
-	Net.throwItem.send({ slot = selectedSlot, direction = direction })
+	Net.throwItem.send({ slot = selectedSlot, direction = direction, charge = charge })
 	return true
+end
+
+--========================================================================
+-- CHARGING
+--========================================================================
+
+-- A charge can run only while a throw could: playing, not typing, and with
+-- something in the selected slot.
+local function canCharge(): boolean
+	return inputAllowed() and (slotItems[selectedSlot] or "") ~= ""
+end
+
+local function chargeLevel(startedAt: number): number
+	return math.clamp((os.clock() - startedAt) / Config.Throw.ChargeTime, 0, 1)
+end
+
+local function hideChargeBar()
+	local bar = chargeBar
+	if bar ~= nil then
+		bar.Visible = false
+	end
+end
+
+function cancelCharge()
+	chargeStartedAt = nil
+	chargeTouch = nil
+	local connection = chargeConnection
+	chargeConnection = nil
+	if connection ~= nil then
+		connection:Disconnect()
+	end
+	hideChargeBar()
+end
+
+-- Draws the bar every frame of a charge, and drops the charge the moment the
+-- hand can no longer throw.
+local function drawCharge()
+	local startedAt = chargeStartedAt
+	if startedAt == nil then
+		return
+	end
+	if not canCharge() then
+		cancelCharge()
+		return
+	end
+	local bar, fill = chargeBar, chargeFill
+	if bar == nil or fill == nil then
+		return
+	end
+	bar.Visible = os.clock() - startedAt >= Config.Throw.BarDelay
+	-- Fills from the bottom: the Fill is anchored at its bottom edge in Studio.
+	fill.Size = UDim2.fromScale(1, chargeLevel(startedAt))
+end
+
+local function beginCharge(): boolean
+	if chargeStartedAt ~= nil or not canCharge() then
+		return false
+	end
+	chargeStartedAt = os.clock()
+	chargeConnection = RunService.RenderStepped:Connect(drawCharge)
+	return true
+end
+
+-- Throws with however much was charged. False if there was no charge to
+-- release or the throw did not go out.
+local function releaseCharge(): boolean
+	local startedAt = chargeStartedAt
+	if startedAt == nil then
+		return false
+	end
+	local charge = chargeLevel(startedAt)
+	cancelCharge()
+	return throwSelected(charge)
 end
 
 local function dropSelected(): boolean
@@ -428,15 +528,21 @@ local function onSelectAction(
 	return Enum.ContextActionResult.Sink
 end
 
+-- Press starts the charge, release throws it. A cancelled input (focus lost
+-- mid-hold) drops the charge rather than throwing.
 local function onThrowAction(
 	_actionName: string,
 	state: Enum.UserInputState,
 	_input: InputObject
 ): Enum.ContextActionResult
-	if state ~= Enum.UserInputState.Begin then
-		return Enum.ContextActionResult.Pass
+	if state == Enum.UserInputState.Begin then
+		return if beginCharge() then Enum.ContextActionResult.Sink else Enum.ContextActionResult.Pass
+	elseif state == Enum.UserInputState.End then
+		return if releaseCharge() then Enum.ContextActionResult.Sink else Enum.ContextActionResult.Pass
+	elseif state == Enum.UserInputState.Cancel then
+		cancelCharge()
 	end
-	return if throwSelected() then Enum.ContextActionResult.Sink else Enum.ContextActionResult.Pass
+	return Enum.ContextActionResult.Pass
 end
 
 local function onDropAction(
@@ -510,6 +616,8 @@ local function applyPhase(phase: Match.PlayerPhase)
 	if phase == "Playing" then
 		bindActions()
 	else
+		-- Unbinding means the release never arrives; the charge goes now.
+		cancelCharge()
 		unbindActions()
 	end
 end
@@ -534,6 +642,22 @@ local function clearGuiBindings()
 	mobileControls = nil
 	throwButton = nil
 	dropButton = nil
+	chargeBar = nil
+	chargeFill = nil
+	cancelCharge()
+end
+
+-- HUD.Root.ChargeBar with a Fill inside. Optional, like everything drawn here.
+local function bindChargeBar(root: Instance)
+	local bar = root:FindFirstChild("ChargeBar")
+	local fill = if bar ~= nil then bar:FindFirstChild("Fill") else nil
+	if bar == nil or not bar:IsA("GuiObject") or fill == nil or not fill:IsA("GuiObject") then
+		log.warn("HUD.Root has no ChargeBar.Fill -- throws still charge, but the bar will not draw")
+		return
+	end
+	bar.Visible = false
+	chargeBar = bar
+	chargeFill = fill
 end
 
 local function bindSlot(index: number, frame: GuiObject)
@@ -623,10 +747,16 @@ local function bindMobileControls(root: Instance)
 	dropButton = drop
 
 	if throw ~= nil then
+		-- Touch down starts the charge; the same touch ending -- wherever the
+		-- finger is by then -- throws it (see the InputEnded hook in Start).
 		table.insert(
 			guiConnections,
-			throw.Activated:Connect(function()
-				throwSelected()
+			throw.InputBegan:Connect(function(input: InputObject)
+				local isPress = input.UserInputType == Enum.UserInputType.Touch
+					or input.UserInputType == Enum.UserInputType.MouseButton1
+				if isPress and beginCharge() then
+					chargeTouch = input
+				end
 			end)
 		)
 	end
@@ -673,6 +803,7 @@ local function bindHud(hud: ScreenGui)
 	end
 
 	bindMobileControls(root)
+	bindChargeBar(root)
 
 	local toolbar = root:WaitForChild("Toolbar", SCREEN_TIMEOUT)
 	if generation ~= bindGeneration then
@@ -773,6 +904,15 @@ function ToolbarController.Start()
 
 	Device.onChanged(function()
 		refreshDevice()
+	end)
+
+	-- The end of the touch that started a charge on the ThrowButton. Global
+	-- rather than on the button: a thumb that drifts off the button while
+	-- charging must still throw when it lifts.
+	UserInputService.InputEnded:Connect(function(input: InputObject)
+		if chargeTouch ~= nil and input == chargeTouch then
+			releaseCharge()
+		end
 	end)
 
 	local playerGui = player:WaitForChild("PlayerGui")

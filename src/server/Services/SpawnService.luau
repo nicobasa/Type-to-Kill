@@ -170,7 +170,7 @@ end
 ]]
 local function livingEnemyPositions(player: Player): { Vector3 }
 	local positions: { Vector3 } = {}
-	local usesTeams = RoundService.getMode().UsesTeams
+	local usesTeams = RoundService.getTeamMode().UsesTeams
 	local team = TeamService.getTeam(player)
 
 	for _, other in ParticipantService.getPlaying() do
@@ -212,14 +212,20 @@ end
 --[[
 	"Red" | "Blue" | "FFA", the vocabulary MapService.getSpawns speaks.
 
-	A Team Deathmatch player with no team should not reach here --
-	ParticipantService only spawns them after TeamService.assign succeeds --
-	but FFA is the honest fallback rather than an error: MapService already
-	falls back to FFA spawns for a map that tagged no team spawns, so this
-	stays consistent with it, and a missing team must never mean "no spawn".
+	Only a mode with TeamSpawns uses a team's own spawn points; the maps author
+	Red and Blue spawns and nothing else. Four teams therefore draw from the
+	shared FFA pool, and livingEnemyPositions (which treats only the player's
+	own team as friends) keeps them away from the other three.
+
+	A team-mode player with no team should not reach here -- ParticipantService
+	only spawns them after TeamService.assign succeeds -- but FFA is the honest
+	fallback rather than an error: MapService already falls back to FFA spawns
+	for a map that tagged no team spawns, so this stays consistent with it, and
+	a missing team must never mean "no spawn".
 ]]
 local function spawnKind(player: Player): string
-	if not RoundService.getMode().UsesTeams then
+	local mode = RoundService.getTeamMode()
+	if not mode.UsesTeams or not mode.TeamSpawns then
 		return "FFA"
 	end
 	local team = TeamService.getTeam(player)

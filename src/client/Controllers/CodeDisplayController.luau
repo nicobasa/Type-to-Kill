@@ -56,6 +56,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
+local Config = require(ReplicatedStorage.Shared.Config)
 local Log = require(ReplicatedStorage.Shared.Log)
 local Match = require(ReplicatedStorage.Shared.Match)
 local MatchController = require(script.Parent.MatchController)
@@ -101,6 +102,26 @@ local SIGN_TEXT_ROTATION = 0
 	discussing.
 ]]
 local SIGN_PIXELS_PER_STUD = 100
+
+--[[
+	How a code is printed on the plate. Eight digits in a row is a string the
+	eye has to count; split into two groups of four ("1234 5678") it reads as
+	two numbers, which is how anyone reads a long number. Presentation only:
+	the space is never part of the code, and the player types the eight
+	digits without it.
+]]
+local GROUP_SIZE = 4
+
+local function displayCode(code: string): string
+	if #code <= GROUP_SIZE then
+		return code
+	end
+	local groups: { string } = {}
+	for index = 1, #code, GROUP_SIZE do
+		table.insert(groups, string.sub(code, index, index + GROUP_SIZE - 1))
+	end
+	return table.concat(groups, " ")
+end
 
 type Relationship = "Self" | "Teammate" | "Enemy" | "Unknown"
 
@@ -370,7 +391,10 @@ local function applyStyle(entry: Entry)
 
 	local billboard = display.billboard
 	if billboard ~= nil then
-		billboard.Size = style.Size
+		-- Wider for longer codes, like the Sign the server stretches
+		-- (Config.GameModes SignWidthScale), so the digits keep their size.
+		local widthScale = Config.GameModes[MatchController.getGameModeId()].SignWidthScale
+		billboard.Size = UDim2.fromOffset(style.Size.X.Offset * widthScale, style.Size.Y.Offset)
 		billboard.MaxDistance = style.MaxDistance
 	end
 
@@ -659,7 +683,7 @@ function refresh(entry: Entry)
 
 	-- Assigned every time rather than only on creation: a respawn is a NEW
 	-- code on the same body (CodeService.assign, previousCodes).
-	display.codeLabel.Text = code
+	display.codeLabel.Text = displayCode(code)
 	applyStyle(entry)
 end
 
@@ -770,13 +794,13 @@ function CodeDisplayController.Start()
 
 	--[[
 		Restyle, never rebuild. Players covers a team being picked and a phase
-		moving; ModeId covers the whole TDM/FFA fork, where every teammate in
+		moving; TeamModeId covers the whole teams/FFA fork, where every teammate in
 		the server becomes an enemy at once. Both fire on subscribe, so the
 		bodies already on screen are styled by this call and not by the next
 		kill.
 	]]
 	MatchController.observe({ "Players" }, restyleAll)
-	MatchController.observe({ "ModeId" }, restyleAll)
+	MatchController.observe({ "TeamModeId" }, restyleAll)
 
 	log.debug("drawing kill codes from codeVisibility")
 end

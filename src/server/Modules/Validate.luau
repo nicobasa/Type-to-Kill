@@ -134,8 +134,9 @@ end
 	headband at a glance. That is also why this takes a string and has no
 	numeric overload to reach for.
 ]]
--- Built once per distinct `digits`. There is exactly one in practice
--- (Config.Code.Digits), so this is a one-entry table, not a cache that grows.
+-- Built once per distinct `digits`. There is one per ruleset in
+-- Config.GameModes (4 and 8 today), so this is a small fixed table, not a
+-- cache that grows.
 local codePatterns: { [number]: string } = {}
 
 function Validate.code(code: string, digits: number): boolean

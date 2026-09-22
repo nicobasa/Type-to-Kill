@@ -1,18 +1,26 @@
 --!strict
 --[[
-	The fifteen-second ballot, drawn client side: pick a map, pick a mode, then
-	watch the tally.
+	The fifteen-second ballot, drawn client side: pick a map, then a game mode
+	(the ruleset), then a team mode, then watch the tally.
 
 	The screen is authored in Studio and only found here (ARCHITECTURE.md, "The
 	map"). The one thing this file creates is clones of the authored
-	OptionTemplate and RowTemplate, which exist for exactly that.
+	OptionTemplate and SummaryTemplate, which exist for exactly that.
+
+	THE LAYOUT, top to bottom: a header (step counter, title, subtitle, and the
+	timer on the right), a three-segment progress bar -- one segment per ballot
+	-- and then either the options for the current ballot as full-width rows,
+	or, once all three are cast, one summary row per ballot saying what is
+	winning. Each option row carries a thin bar showing its share of that
+	ballot's votes, so the tally reads at a glance instead of as three numbers
+	to compare.
 
 	WHY THE REBUILD IS GUARDED
 
 	Two things move this panel, at very different rates. The BALLOT -- which
-	maps are on offer -- changes once a round. The TALLY changes every time
+	options are on offer -- changes once a step. The TALLY changes every time
 	anyone in the server clicks, which over fifteen seconds of a full server is
-	more or less constant. Rebuilding the cards on a tally change would destroy
+	more or less constant. Rebuilding the rows on a tally change would destroy
 	and recreate the button under the player's cursor between the press and the
 	release: the release then lands on an instance that no longer has a parent,
 	and the vote the player thought they cast never happens. So the clones are
@@ -21,7 +29,7 @@
 	The other half of that: a rebuild DESTROYS the previous clones first. Clones
 	merely left behind accumulate one ballot per round for the whole session --
 	a leak that is also plainly visible, as a list that grows a duplicate set of
-	cards every few minutes.
+	rows every few minutes.
 
 	WHY THE SCREEN IS BOUND IN A LOOP
 
@@ -48,7 +56,6 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
-local Config = require(ReplicatedStorage.Shared.Config)
 local Log = require(ReplicatedStorage.Shared.Log)
 local MapCatalog = require(ReplicatedStorage.Shared.MapCatalog)
 local Match = require(ReplicatedStorage.Shared.Match)
@@ -73,46 +80,42 @@ local SCREEN_TIMEOUT = 10
 -- difference.
 local TIMER_INTERVAL = 0.25
 
-type Ballot = "Map" | "Mode"
-type Step = "Map" | "Mode" | "Summary"
+-- The progress segments: the accent for a step done or in progress, a dim
+-- slate for one still to come. The accent is the UI's cyan (MainMenu, CashPill).
+local STEP_ACTIVE_COLOR = Color3.fromRGB(0, 200, 255)
+local STEP_PENDING_COLOR = Color3.fromRGB(44, 50, 66)
+
+type Ballot = "Map" | "GameMode" | "TeamMode"
+type Step = Ballot | "Summary"
+
+-- The order a player is walked through. The index is the step number shown.
+local BALLOT_ORDER: { Ballot } = { "Map", "GameMode", "TeamMode" }
 
 type OptionCard = {
 	root: GuiButton,
 	nameLabel: TextLabel,
 	taglineLabel: TextLabel,
 	voteCountLabel: TextLabel,
+	shareBar: GuiObject,
 }
 
-type RowCard = {
+type SummaryCard = {
 	root: GuiObject,
+	nameLabel: TextLabel,
 	countLabel: TextLabel,
 }
 
---[[
-	The clones of one summary column, plus the id list they were built from.
-	Keeping the list is what makes "did the ballot change?" answerable without
-	touching a single instance.
-]]
-type RowState = {
-	clones: { [string]: RowCard },
-	order: { string },
-}
-
---[[
-	The column HeaderLabels are deliberately absent: they are written once, as
-	the tree is resolved, and never read again. A field nothing reads is a
-	field the next reader has to prove nothing reads.
-]]
 type Elements = {
+	stepLabel: TextLabel,
 	titleLabel: TextLabel,
 	subtitleLabel: TextLabel,
 	timerLabel: TextLabel,
+	-- Progress segments, in ballot order.
+	segments: { GuiObject },
 	options: GuiObject,
 	optionTemplate: GuiButton,
 	summary: GuiObject,
-	mapRows: GuiObject,
-	modeRows: GuiObject,
-	rowTemplate: GuiObject,
+	summaryTemplate: GuiObject,
 }
 
 -- Round.Vote as RoundService writes it (its RoundData type is the contract).
@@ -120,33 +123,38 @@ type Elements = {
 type VoteTable = {
 	MapChoices: { string },
 	MapVotes: { [string]: number },
-	ModeVotes: { [string]: number },
+	GameModeVotes: { [string]: number },
+	TeamModeVotes: { [string]: number },
 }
 
 local STEP_TITLE: { [string]: string } = {
 	Map = "CHOOSE A MAP",
-	Mode = "CHOOSE A MODE",
+	GameMode = "CHOOSE A GAME MODE",
+	TeamMode = "CHOOSE THE TEAMS",
 	Summary = "VOTES SO FAR",
 }
 
 local STEP_SUBTITLE: { [string]: string } = {
 	Map = "Most votes wins. A tie breaks at random.",
-	Mode = "Most votes wins. A tie breaks at random.",
-	Summary = "The ballot closes when the timer runs out.",
+	GameMode = "The rules: code length, or a faster pace.",
+	TeamMode = "Two teams, four teams, or everyone for themselves.",
+	Summary = "The vote closes when the timer runs out.",
+}
+
+-- What the summary row calls each ballot.
+local BALLOT_KIND: { [string]: string } = {
+	Map = "MAP",
+	GameMode = "GAME MODE",
+	TeamMode = "TEAMS",
 }
 
 --[[
-	The mode ballot, mirroring VoteService's exactly.
-
-	The server builds its own from Match.MODE_ORDER capped at
-	Config.Voting.MaxModeChoices, and drops a vote for anything past the cap --
-	so a card drawn past it would be a button that silently does nothing. The
-	cap belongs on both sides or on neither.
+	The two mode ballots, mirroring VoteService's exactly: the same Match ORDER
+	lists, so every row here is an option the server accepts, and nothing the
+	server accepts is missing here.
 ]]
-local MODE_BALLOT: { string } = {}
-for index = 1, math.min(Config.Voting.MaxModeChoices, #Match.MODE_ORDER) do
-	table.insert(MODE_BALLOT, Match.MODE_ORDER[index])
-end
+local GAME_MODE_BALLOT: { string } = table.clone(Match.GAME_MODE_ORDER) :: { any }
+local TEAM_MODE_BALLOT: { string } = table.clone(Match.TEAM_MODE_ORDER) :: { any }
 
 local VoteController = {}
 
@@ -159,12 +167,12 @@ local optionCards: { [string]: OptionCard } = {}
 local optionOrder: { string } = {}
 local optionBallot: Ballot? = nil
 
-local mapRowState: RowState = { clones = {}, order = {} }
-local modeRowState: RowState = { clones = {}, order = {} }
+-- One summary row per ballot, built once per open panel.
+local summaryCards: { [string]: SummaryCard } = {}
 
--- What THIS player picked. See the header: the replica cannot tell us.
-local mapChoice: string? = nil
-local modeChoice: string? = nil
+-- What THIS player picked, per ballot. See the header: the replica cannot
+-- tell us.
+local choices: { [string]: string } = {}
 
 local timerConnection: RBXScriptConnection? = nil
 
@@ -200,24 +208,25 @@ end
 	Display name and one-line tagline for a ballot entry.
 ]]
 local function describe(ballot: Ballot, id: string): (string, string)
-	if ballot == "Mode" then
-		local mode = Match.MODES[id]
+	if ballot == "GameMode" then
+		local mode = Match.GAME_MODES[id]
 		if mode == nil then
 			return id, ""
 		end
-		--[[
-			A GameMode has no Tagline field and should not grow one for this
-			panel: the only thing that actually differs between the two modes
-			is whether there are teams, and that is already a field. Prose
-			invented here would be a third place to keep mode copy.
-		]]
-		return mode.DisplayName, if mode.UsesTeams then "Two teams" else "Everyone for themselves"
+		return mode.DisplayName, mode.Tagline
+	end
+	if ballot == "TeamMode" then
+		local mode = Match.TEAM_MODES[id]
+		if mode == nil then
+			return id, ""
+		end
+		return mode.DisplayName, mode.Tagline
 	end
 
 	local definition = MapCatalog.byId(id)
 	if definition == nil then
 		-- A ballot entry this catalog does not know means the client is a
-		-- version behind the server. Draw the raw id: a blank card hides the
+		-- version behind the server. Draw the raw id: a blank row hides the
 		-- skew, and someone has to see it to fix it.
 		return id, ""
 	end
@@ -225,8 +234,11 @@ local function describe(ballot: Ballot, id: string): (string, string)
 end
 
 local function choicesFor(ballot: Ballot): { string }
-	if ballot == "Mode" then
-		return MODE_BALLOT
+	if ballot == "GameMode" then
+		return GAME_MODE_BALLOT
+	end
+	if ballot == "TeamMode" then
+		return TEAM_MODE_BALLOT
 	end
 	local current = vote
 	if current == nil then
@@ -240,11 +252,13 @@ local function votesFor(ballot: Ballot): { [string]: number }?
 	if current == nil then
 		return nil
 	end
-	return if ballot == "Map" then current.MapVotes else current.ModeVotes
-end
-
-local function chosenFor(ballot: Ballot): string?
-	return if ballot == "Map" then mapChoice else modeChoice
+	if ballot == "GameMode" then
+		return current.GameModeVotes
+	end
+	if ballot == "TeamMode" then
+		return current.TeamModeVotes
+	end
+	return current.MapVotes
 end
 
 local function countOf(counts: { [string]: number }?, id: string): number
@@ -254,17 +268,48 @@ local function countOf(counts: { [string]: number }?, id: string): number
 	return counts[id] or 0
 end
 
+local function totalOf(counts: { [string]: number }?, ids: { string }): number
+	local total = 0
+	for _, id in ids do
+		total += countOf(counts, id)
+	end
+	return total
+end
+
+local function votesText(count: number): string
+	return if count == 1 then "1 VOTE" else `{count} VOTES`
+end
+
+local function sendVote(ballot: Ballot, id: string)
+	if ballot == "Map" then
+		Net.voteMap.send({ mapId = id })
+	elseif ballot == "GameMode" then
+		Net.voteGameMode.send({ modeId = id })
+	else
+		Net.voteTeamMode.send({ modeId = id })
+	end
+end
+
+local function nextStep(ballot: Ballot): Step
+	local index = table.find(BALLOT_ORDER, ballot)
+	if index ~= nil and index < #BALLOT_ORDER then
+		return BALLOT_ORDER[index + 1]
+	end
+	return "Summary"
+end
+
 --[[
 	Pulls the authored labels out of a fresh clone.
 
 	Returns nil rather than erroring on a template missing a label: this runs
 	inside a list build, and one malformed template should cost the panel a
-	warning and one card, not the whole vote screen.
+	warning and one row, not the whole vote screen.
 ]]
 local function buildCard(clone: GuiButton): OptionCard?
 	local nameLabel = clone:FindFirstChild("NameLabel")
 	local taglineLabel = clone:FindFirstChild("TaglineLabel")
 	local voteCountLabel = clone:FindFirstChild("VoteCountLabel")
+	local shareBar = clone:FindFirstChild("ShareBar")
 
 	if
 		nameLabel == nil
@@ -273,6 +318,8 @@ local function buildCard(clone: GuiButton): OptionCard?
 		or not taglineLabel:IsA("TextLabel")
 		or voteCountLabel == nil
 		or not voteCountLabel:IsA("TextLabel")
+		or shareBar == nil
+		or not shareBar:IsA("GuiObject")
 	then
 		return nil
 	end
@@ -282,6 +329,7 @@ local function buildCard(clone: GuiButton): OptionCard?
 		nameLabel = nameLabel,
 		taglineLabel = taglineLabel,
 		voteCountLabel = voteCountLabel,
+		shareBar = shareBar,
 	}
 end
 
@@ -299,36 +347,25 @@ local function destroyOptionCards()
 	optionBallot = nil
 end
 
-local function destroyRows(state: RowState)
-	for _, card in state.clones do
+local function destroySummaryCards()
+	for _, card in summaryCards do
 		card.root:Destroy()
 	end
-	table.clear(state.clones)
-	table.clear(state.order)
+	table.clear(summaryCards)
 end
 
 local function onOptionActivated(ballot: Ballot, id: string)
 	-- The SEND is skipped for a repeat of the choice already held --
 	-- VoteService drops a re-send of an identical vote before it costs a
 	-- replication packet, so there is nothing to gain by making the trip.
-	if chosenFor(ballot) ~= id then
-		if ballot == "Map" then
-			mapChoice = id
-			Net.voteMap.send({ mapId = id })
-		else
-			modeChoice = id
-			Net.voteMode.send({ modeId = id })
-		end
+	if choices[ballot] ~= id then
+		choices[ballot] = id
+		sendVote(ballot, id)
 	end
 
-	--[[
-		Straight to the next step, on the click itself. There used to be a
-		0.45s beat here, and a YOUR VOTE badge on the chosen card to fill it;
-		players read the pause as lag between the two ballots, so both went.
-		The next step appearing IS the acknowledgement, and the Summary step
-		shows both choices afterwards.
-	]]
-	step = if ballot == "Map" then "Mode" else "Summary"
+	-- Straight to the next step, on the click itself. The next step appearing
+	-- IS the acknowledgement, and the summary shows every choice afterwards.
+	step = nextStep(ballot)
 	refresh()
 end
 
@@ -353,7 +390,7 @@ local function syncOptions(ui: Elements, ballot: Ballot)
 			local card = buildCard(clone)
 			if card == nil then
 				clone:Destroy()
-				log.warn(`OptionTemplate is missing a label -- the ballot cannot draw "{id}"`)
+				log.warn(`OptionTemplate is missing a label or its ShareBar -- the ballot cannot draw "{id}"`)
 				continue
 			end
 
@@ -363,7 +400,7 @@ local function syncOptions(ui: Elements, ballot: Ballot)
 			clone.Name = id
 			-- The layout sorts on LayoutOrder. By name it would put Dockyard
 			-- above NeonDistrict whatever order the server actually drew, and
-			-- for modes it would lose Match.MODE_ORDER entirely.
+			-- for modes it would lose Match's ORDER lists entirely.
 			clone.LayoutOrder = index
 			clone.Visible = true
 
@@ -383,51 +420,99 @@ local function syncOptions(ui: Elements, ballot: Ballot)
 	-- Everything from here runs on every tally change and touches no
 	-- instance's existence. That is the whole point of the guard above.
 	local counts = votesFor(ballot)
+	local total = totalOf(counts, ids)
 	for id, card in optionCards do
-		-- The bare number, not "3 VOTES": VoteCountLabel is authored as a small
-		-- badge sized for a digit, and the card around it already says what is
-		-- being counted.
-		card.voteCountLabel.Text = `{countOf(counts, id)}`
+		local count = countOf(counts, id)
+		card.voteCountLabel.Text = `{count}`
+		-- The share of this ballot's votes, as the width of the bar under the
+		-- row. Zero votes in total draws no bar at all rather than dividing
+		-- by zero into a NaN width.
+		local share = if total > 0 then count / total else 0
+		card.shareBar.Size = UDim2.new(share, 0, card.shareBar.Size.Y.Scale, card.shareBar.Size.Y.Offset)
 	end
 end
 
-local function syncRows(ui: Elements, container: GuiObject, state: RowState, ballot: Ballot)
+--[[
+	What is winning a ballot right now: the leading option's name and its
+	count, or a tie named as such. The tie is shown honestly -- "TIED" -- rather
+	than as whichever of the tied options happens to sort first, because the
+	server will break it at random and a row naming one of them would be a
+	promise it cannot keep.
+]]
+local function leaderOf(ballot: Ballot): (string, string)
 	local ids = choicesFor(ballot)
+	local counts = votesFor(ballot)
 
-	if not sameList(state.order, ids) then
-		destroyRows(state)
-		state.order = table.clone(ids)
+	local best = 0
+	local leaders: { string } = {}
+	for _, id in ids do
+		local count = countOf(counts, id)
+		if count > best then
+			best = count
+			table.clear(leaders)
+			table.insert(leaders, id)
+		elseif count == best and count > 0 then
+			table.insert(leaders, id)
+		end
+	end
 
-		for index, id in ids do
-			local clone = ui.rowTemplate:Clone() :: GuiObject
+	if best == 0 then
+		return "NO VOTES YET", ""
+	end
+	if #leaders > 1 then
+		local names: { string } = {}
+		for _, id in leaders do
+			table.insert(names, (describe(ballot, id)))
+		end
+		return `TIED: {table.concat(names, " / ")}`, votesText(best)
+	end
+	return (describe(ballot, leaders[1])), votesText(best)
+end
+
+local function syncSummary(ui: Elements)
+	-- Annotated: an inferred loop value widens Ballot to `string`.
+	for index, ballot: Ballot in BALLOT_ORDER do
+		local card = summaryCards[ballot]
+		if card == nil then
+			local clone = ui.summaryTemplate:Clone() :: GuiObject
+			local kindLabel = clone:FindFirstChild("KindLabel")
 			local nameLabel = clone:FindFirstChild("NameLabel")
 			local countLabel = clone:FindFirstChild("CountLabel")
 			if
-				nameLabel == nil
+				kindLabel == nil
+				or not kindLabel:IsA("TextLabel")
+				or nameLabel == nil
 				or not nameLabel:IsA("TextLabel")
 				or countLabel == nil
 				or not countLabel:IsA("TextLabel")
 			then
 				clone:Destroy()
-				log.warn(`RowTemplate is missing NameLabel or CountLabel -- the tally cannot draw "{id}"`)
-				continue
+				log.warn("SummaryTemplate is missing KindLabel, NameLabel or CountLabel -- the tally cannot draw")
+				return
 			end
 
-			local name = describe(ballot, id)
-			nameLabel.Text = name
-
-			clone.Name = id
+			kindLabel.Text = BALLOT_KIND[ballot]
+			clone.Name = `{ballot}Summary`
 			clone.LayoutOrder = index
 			clone.Visible = true
-			clone.Parent = container
+			clone.Parent = ui.summary
 
-			state.clones[id] = { root = clone, countLabel = countLabel }
+			card = { root = clone, nameLabel = nameLabel, countLabel = countLabel }
+			summaryCards[ballot] = card
 		end
-	end
 
-	local counts = votesFor(ballot)
-	for id, card in state.clones do
-		card.countLabel.Text = `{countOf(counts, id)}`
+		local name, count = leaderOf(ballot)
+		card.nameLabel.Text = name
+		card.countLabel.Text = count
+	end
+end
+
+local function syncProgress(ui: Elements)
+	-- The segment for the current ballot and every one before it lights; in
+	-- the summary they all do.
+	local current = if step == "Summary" then #BALLOT_ORDER + 1 else table.find(BALLOT_ORDER, step) or 1
+	for index, segment in ui.segments do
+		segment.BackgroundColor3 = if index <= current then STEP_ACTIVE_COLOR else STEP_PENDING_COLOR
 	end
 end
 
@@ -439,22 +524,25 @@ function refresh()
 
 	ui.titleLabel.Text = STEP_TITLE[step]
 	ui.subtitleLabel.Text = STEP_SUBTITLE[step]
+	syncProgress(ui)
 
-	local ballot: Ballot? = if step == "Map" then "Map" elseif step == "Mode" then "Mode" else nil
-
-	ui.options.Visible = ballot ~= nil
-	ui.summary.Visible = ballot == nil
-
-	if ballot ~= nil then
-		syncOptions(ui, ballot)
+	if step == "Summary" then
+		ui.stepLabel.Text = "ALL VOTES CAST"
+		ui.options.Visible = false
+		ui.summary.Visible = true
+		-- The rows belong to the step that built them. Parking them behind a
+		-- hidden frame is exactly the accumulation this panel exists to avoid.
+		destroyOptionCards()
+		syncSummary(ui)
 		return
 	end
 
-	-- The cards belong to the step that built them. Parking them behind a
-	-- hidden frame is exactly the accumulation this panel exists to avoid.
-	destroyOptionCards()
-	syncRows(ui, ui.mapRows, mapRowState, "Map")
-	syncRows(ui, ui.modeRows, modeRowState, "Mode")
+	-- Annotated: `step` is a Step here, and only a Ballot is a key below.
+	local ballot: Ballot = step :: Ballot
+	ui.stepLabel.Text = `STEP {table.find(BALLOT_ORDER, ballot) or 1} OF {#BALLOT_ORDER}`
+	ui.options.Visible = true
+	ui.summary.Visible = false
+	syncOptions(ui, ballot)
 end
 
 local function stopTimer()
@@ -550,8 +638,7 @@ local function openVote()
 	-- A ballot is per round. Anything carried in from the last one is a vote
 	-- for a map that is no longer on offer, on a step the player never took.
 	step = "Map"
-	mapChoice = nil
-	modeChoice = nil
+	table.clear(choices)
 
 	show()
 end
@@ -567,8 +654,7 @@ local function closeVote()
 	-- the "left running off screen" the project rules name.
 	stopTimer()
 	destroyOptionCards()
-	destroyRows(mapRowState)
-	destroyRows(modeRowState)
+	destroySummaryCards()
 
 	-- UIController.isOpen is false for a screen this build never authored, and
 	-- for one whose tree has just been re-cloned out from under us, so asking
@@ -633,32 +719,36 @@ local function resolve(gui: Instance): Elements?
 		return current
 	end
 
+	local stepLabel = grab("Panel.Header.StepLabel", "TextLabel") :: TextLabel?
 	local titleLabel = grab("Panel.Header.TitleLabel", "TextLabel") :: TextLabel?
 	local subtitleLabel = grab("Panel.Header.SubtitleLabel", "TextLabel") :: TextLabel?
-	local timerLabel = grab("Panel.TimerLabel", "TextLabel") :: TextLabel?
+	local timerLabel = grab("Panel.Header.TimerLabel", "TextLabel") :: TextLabel?
 	local options = grab("Panel.Options", "GuiObject") :: GuiObject?
-	-- A GuiButton, not a GuiObject: a ballot whose cards cannot be clicked is
+	-- A GuiButton, not a GuiObject: a ballot whose rows cannot be clicked is
 	-- not a degraded vote panel, it is a vote nobody can cast.
 	local optionTemplate = grab("Panel.OptionTemplate", "GuiButton") :: GuiButton?
 	local summary = grab("Panel.Summary", "GuiObject") :: GuiObject?
-	local mapHeaderLabel = grab("Panel.Summary.MapColumn.HeaderLabel", "TextLabel") :: TextLabel?
-	local mapRows = grab("Panel.Summary.MapColumn.Rows", "GuiObject") :: GuiObject?
-	local modeHeaderLabel = grab("Panel.Summary.ModeColumn.HeaderLabel", "TextLabel") :: TextLabel?
-	local modeRows = grab("Panel.Summary.ModeColumn.Rows", "GuiObject") :: GuiObject?
-	local rowTemplate = grab("Panel.RowTemplate", "GuiObject") :: GuiObject?
+	local summaryTemplate = grab("Panel.SummaryTemplate", "GuiObject") :: GuiObject?
+
+	-- One segment per ballot, Step1..StepN, in order.
+	local segments: { GuiObject } = {}
+	for index = 1, #BALLOT_ORDER do
+		local segment = grab(`Panel.Progress.Step{index}`, "GuiObject") :: GuiObject?
+		if segment == nil then
+			return nil
+		end
+		table.insert(segments, segment)
+	end
 
 	if
-		titleLabel == nil
+		stepLabel == nil
+		or titleLabel == nil
 		or subtitleLabel == nil
 		or timerLabel == nil
 		or options == nil
 		or optionTemplate == nil
 		or summary == nil
-		or mapHeaderLabel == nil
-		or mapRows == nil
-		or modeHeaderLabel == nil
-		or modeRows == nil
-		or rowTemplate == nil
+		or summaryTemplate == nil
 	then
 		-- grab() already named every element it could not find. An incomplete
 		-- screen is a Studio authoring slip, not a reason to error a boot.
@@ -666,26 +756,21 @@ local function resolve(gui: Instance): Elements?
 	end
 
 	-- The templates sit beside their containers rather than inside them, so an
-	-- author who left one visible would ship a permanent extra card. Hidden
+	-- author who left one visible would ship a permanent extra row. Hidden
 	-- here rather than relied upon to have been hidden there.
 	optionTemplate.Visible = false
-	rowTemplate.Visible = false
-
-	-- The column headers never change. Written once per tree, so the panel
-	-- never shows whatever placeholder the layout was authored with.
-	mapHeaderLabel.Text = "MAP"
-	modeHeaderLabel.Text = "MODE"
+	summaryTemplate.Visible = false
 
 	return {
+		stepLabel = stepLabel,
 		titleLabel = titleLabel,
 		subtitleLabel = subtitleLabel,
 		timerLabel = timerLabel,
+		segments = segments,
 		options = options,
 		optionTemplate = optionTemplate,
 		summary = summary,
-		mapRows = mapRows,
-		modeRows = modeRows,
-		rowTemplate = rowTemplate,
+		summaryTemplate = summaryTemplate,
 	}
 end
 
@@ -710,11 +795,7 @@ local function detach()
 	table.clear(optionCards)
 	table.clear(optionOrder)
 	optionBallot = nil
-
-	table.clear(mapRowState.clones)
-	table.clear(mapRowState.order)
-	table.clear(modeRowState.clones)
-	table.clear(modeRowState.order)
+	table.clear(summaryCards)
 end
 
 --[[

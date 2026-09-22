@@ -404,12 +404,12 @@ local function onRequestPlay(player: Player)
 	end
 
 	--[[
-		The whole TDM/FFA fork, read off the mode rather than compared against
-		a mode id (Match.GameMode.UsesTeams exists for exactly this). Team
-		Deathmatch gets no character yet -- the client draws the team screen
-		from this phase and answers with requestTeam.
+		The whole teams/FFA fork, read off the mode rather than compared against
+		a mode id (Match.TeamMode.UsesTeams exists for exactly this). A team
+		mode gets no character yet -- the client draws the team screen from
+		this phase and answers with requestTeam.
 	]]
-	if RoundService.getMode().UsesTeams then
+	if RoundService.getTeamMode().UsesTeams then
 		ParticipantService.setPhase(player, "TeamSelect")
 		return
 	end
@@ -424,7 +424,8 @@ local function onRequestTeam(player: Player, team: string)
 	end
 
 	-- Free For All has no team screen, so nothing legitimate sends this.
-	if not RoundService.getMode().UsesTeams then
+	local mode = RoundService.getTeamMode()
+	if not mode.UsesTeams then
 		return
 	end
 
@@ -438,10 +439,16 @@ local function onRequestTeam(player: Player, team: string)
 		return
 	end
 
-	if not Match.isTeamId(team) then
+	--[[
+		One of THIS round's sides, not merely a team that exists. Green is a
+		real team; in a two-team round it is still not one anybody may join,
+		and a client without a Green button is no defence against a client that
+		sends "Green" anyway. TeamService.assign checks the same list again.
+	]]
+	if not Match.modeHasTeam(mode, team) then
 		return
 	end
-	-- isTeamId is a runtime guard, not a type predicate -- a boolean return
+	-- modeHasTeam is a runtime guard, not a type predicate -- a boolean return
 	-- narrows nothing in Luau, so the cast restates what the line above proved.
 	-- The local is annotated as well, or the cast is discarded and teamId
 	-- infers back to the `string` the packet handed us.
@@ -453,7 +460,7 @@ local function onRequestTeam(player: Player, team: string)
 		race: two players pressing RED in the same frame would both see room
 		and both take it.
 	]]
-	if not TeamService.assign(player, teamId) then
+	if not TeamService.assign(player, teamId, mode.Teams) then
 		Net.notice.sendTo({ kind = "Warn", message = `{Match.TEAMS[teamId].DisplayName} TEAM IS FULL` }, player)
 		return
 	end

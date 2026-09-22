@@ -62,6 +62,7 @@ local ServerStorage = game:GetService("ServerStorage")
 
 local CodeService = require(script.Parent.CodeService)
 local Config = require(ReplicatedStorage.Shared.Config)
+local CosmeticsService = require(script.Parent.CosmeticsService)
 local LevelService = require(script.Parent.LevelService)
 local Log = require(ReplicatedStorage.Shared.Log)
 local Net = require(ReplicatedStorage.Shared.Net)
@@ -71,6 +72,7 @@ local RewardService = require(script.Parent.RewardService)
 local RoundService = require(script.Parent.RoundService)
 local ScoreService = require(script.Parent.ScoreService)
 local SpawnService = require(script.Parent.SpawnService)
+local SprintService = require(script.Parent.SprintService)
 local TeamService = require(script.Parent.TeamService)
 local Validate = require(ServerStorage.Modules.Validate)
 
@@ -101,7 +103,16 @@ local submitLimit = RateLimiter.new(Config.RateLimit.CodeSubmit)
 	client maps each to display text, so rewording "NO SUCH CODE" costs no
 	server deploy and no bandwidth (Net.luau, codeResult).
 ]]
-type Reason = "Killed" | "RoundInactive" | "NotPlaying" | "BadCode" | "NoSuchCode" | "Self" | "Friendly" | "Protected"
+type Reason =
+	"Killed"
+	| "RoundInactive"
+	| "NotPlaying"
+	| "Stunned"
+	| "BadCode"
+	| "NoSuchCode"
+	| "Self"
+	| "Friendly"
+	| "Protected"
 
 --[[
 	This player's Humanoid if they are alive, nil in every other case.
@@ -205,13 +216,24 @@ local function onSubmitCode(data: { code: string }, killer: Player)
 	end
 
 	--[[
+		A frag stun takes typing away too. TypeModeController already blocks
+		the digits and says why, but that is the client's picture of the
+		rule; this is the rule. A modified client that sends a code anyway is
+		refused here before the code is even looked at.
+	]]
+	if SprintService.isStunned(killer) then
+		refuse(killer, "Stunned")
+		return
+	end
+
+	--[[
 		ByteNet guaranteed a string arrived. It cannot guarantee four digits,
 		and a near miss that reached the code table would be a free kill --
 		"0047" and 47 are the same number and different codes, so anything that
 		has been through tonumber() has already lost the identity
 		(Validate.luau).
 	]]
-	if not Validate.code(data.code, Config.Code.Digits) then
+	if not Validate.code(data.code, RoundService.getCodeDigits()) then
 		refuse(killer, "BadCode")
 		return
 	end
@@ -244,7 +266,7 @@ local function onSubmitCode(data: { code: string }, killer: Player)
 		Match.GameMode carries this flag precisely so the TDM/FFA fork is read
 		from data at every call site rather than re-decided at each one.
 	]]
-	local mode = RoundService.getMode()
+	local mode = RoundService.getTeamMode()
 	if mode.UsesTeams then
 		local killerTeam = TeamService.getTeam(killer)
 		local targetTeam = TeamService.getTeam(target)
@@ -346,6 +368,7 @@ local function onSubmitCode(data: { code: string }, killer: Player)
 		killerName = killer.DisplayName,
 		killerLevel = toUnsigned(killerLevel, MAX_UINT16),
 		killerKills = toUnsigned(ScoreService.getKills(killer), MAX_UINT16),
+		killerTitle = CosmeticsService.getEquippedTitle(killer),
 		respawnAt = workspace:GetServerTimeNow() + Config.Killcam.Duration,
 	}, target)
 

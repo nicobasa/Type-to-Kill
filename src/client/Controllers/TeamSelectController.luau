@@ -1,7 +1,8 @@
 --!strict
 --[[
-	The team picker: two buttons, two live counts, and a lock that is a
-	prediction rather than a decision.
+	The team picker: one button per side the round plays with (two or four),
+	a live count on each, and a lock that is a prediction rather than a
+	decision.
 
 	WHAT THIS FILE DELIBERATELY DOES NOT DO
 
@@ -253,27 +254,23 @@ local function countSides(players: any): ({ [string]: number }, string)
 end
 
 --[[
-	Would one more player on `team` put the sides further apart than
-	Config.Teams.MaxImbalance? `counts` must already exclude me.
-
-	Two-sided by definition, exactly like TeamService.canJoin: the rule is
-	|Red - Blue|, so there is no third side to generalise over here even though
-	the counts themselves are keyed by id.
+	Would one more player on `team` put the largest and smallest of `teams`
+	further apart than Config.Teams.MaxImbalance? `counts` must already
+	exclude me. The client mirror of TeamService.canJoin; the two must agree.
 
 	It answers for a player who is on NO team, which is the same question
 	canJoin answers and the only one it can answer -- the caller is what has to
 	notice that I already hold the side being tested, because the server skips
 	the balance check outright in that case.
 ]]
-local function wouldExceedImbalance(team: Match.TeamId, counts: { [string]: number }): boolean
-	local red = counts.Red or 0
-	local blue = counts.Blue or 0
-	if team == "Red" then
-		red += 1
-	else
-		blue += 1
+local function wouldExceedImbalance(team: Match.TeamId, counts: { [string]: number }, teams: { Match.TeamId }): boolean
+	local largest, smallest = -math.huge, math.huge
+	for _, side in teams do
+		local count = (counts[side] or 0) + (if side == team then 1 else 0)
+		largest = math.max(largest, count)
+		smallest = math.min(smallest, count)
 	end
-	return math.abs(red - blue) > Config.Teams.MaxImbalance
+	return largest - smallest > Config.Teams.MaxImbalance
 end
 
 local function refresh()
@@ -296,11 +293,25 @@ local function refresh()
 	]]
 	local round = MatchController.getRound()
 	local counts, mine = countSides(if round ~= nil then round.Players else nil)
+	local mode = MatchController.getTeamMode()
 
 	for _, side in sides do
 		-- Annotated: an unannotated local taking a field under refinement
 		-- loses the singleton union, and the helpers below want TeamId.
 		local teamId: Match.TeamId = side.definition.Id
+
+		--[[
+			Only the round's own sides are on offer. A Green button in a
+			two-team round would be a button the server refuses every time
+			(ParticipantService checks the mode's team list), so it is not
+			shown at all. The Options layout fills the width with whichever
+			buttons are visible.
+		]]
+		local inMode = Match.modeHasTeam(mode, teamId)
+		side.button.Visible = inMode
+		if not inMode then
+			continue
+		end
 
 		if side.countLabel ~= nil then
 			local count = counts[teamId] or 0
@@ -321,7 +332,7 @@ local function refresh()
 			already further apart than MaxImbalance, which is the moment the
 			screen most needs to read honestly.
 		]]
-		applyLock(side, mine ~= teamId and wouldExceedImbalance(teamId, counts))
+		applyLock(side, mine ~= teamId and wouldExceedImbalance(teamId, counts, mode.Teams))
 	end
 end
 
@@ -573,6 +584,8 @@ function TeamSelectController.Start()
 		this one.
 	]]
 	MatchController.observe({ "Players" }, refresh)
+	-- Which buttons exist at all depends on the round's team mode.
+	MatchController.observe({ "TeamModeId" }, refresh)
 
 	attachLoop()
 end

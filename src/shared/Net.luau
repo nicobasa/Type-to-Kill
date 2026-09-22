@@ -41,17 +41,16 @@ if RunService:IsClient() then
 end
 
 --[[
-	devSet/devSnapshot move values as `kind` (a type tag) plus a plain `string`,
-	never as ByteNet.unknown. That is the whole point, not a stopgap: the wire
-	type itself is then the guarantee. A struct typed {kind: string, value:
-	string} can only ever deserialize into two scalars, so there is no encoding
-	in which a nested table reaches DevService's validator to begin with --
-	parseValue() there still bounds-checks the string, but the wire shape
-	already rules out the dangerous shape.
+	adminEdit moves values as a plain `string`, never as ByteNet.unknown. That
+	is the whole point, not a stopgap: the wire type itself is then the
+	guarantee. A string field can only ever deserialize into a string, so there
+	is no encoding in which a nested table reaches AdminService's validator to
+	begin with -- the server still parses and bounds-checks it, but the wire
+	shape already rules out the dangerous shape.
 
-	targetUserId is float64, not uint32 -- uint32 tops out around 4.3 billion,
-	which real Roblox UserIds have already exceeded for newer accounts. float64
-	represents every UserId Roblox can issue exactly.
+	Admin UserIds are float64, not uint32 -- uint32 tops out around 4.3
+	billion, which real Roblox UserIds have already exceeded for newer
+	accounts. float64 represents every UserId Roblox can issue exactly.
 ]]
 --[[
 	WHAT IS *NOT* IN HERE, and why -- this list is the useful half of the file.
@@ -139,7 +138,8 @@ return ByteNet.defineNamespace(NAMESPACE, function()
 
 			`reason` is a short tag, not a sentence: "Killed", "NoSuchCode",
 			"Friendly", "Self", "Protected", "NotPlaying", "RoundInactive",
-			"BadCode", "RateLimited". The client maps it to display text, so
+			"Stunned", "BadCode", "RateLimited". The client maps it to display
+			text, so
 			wording changes need no server deploy -- and the server never spends
 			bandwidth on prose.
 
@@ -206,7 +206,53 @@ return ByteNet.defineNamespace(NAMESPACE, function()
 				killerName = ByteNet.string,
 				killerLevel = ByteNet.uint16,
 				killerKills = ByteNet.uint16,
+				-- The killer's equipped title id, "" for none. Denormalised
+				-- into the packet like the name and level: the victim cannot
+				-- read another player's profile, which is private.
+				killerTitle = ByteNet.string,
 				respawnAt = ByteNet.float64,
+			}),
+		}),
+
+		--=====================================================================
+		-- COSMETICS (CosmeticsService)
+		--=====================================================================
+
+		--[[
+			client -> server. Requests, never instructions: the server checks
+			the case exists, takes the Cash itself (CashService.trySpend) and
+			rolls the title itself. The client never names a price or a title
+			it is owed.
+
+			Buying and equipping get no reply packet: the result lands in the
+			profile replica (Inventory, Titles, EquippedTitle) and the screens
+			observe it, the same way Settings works.
+		]]
+		buyCase = ByteNet.definePacket({
+			value = ByteNet.struct({ caseId = ByteNet.string }),
+		}),
+
+		openCase = ByteNet.definePacket({
+			value = ByteNet.struct({ caseId = ByteNet.string }),
+		}),
+
+		-- "" unequips.
+		equipTitle = ByteNet.definePacket({
+			value = ByteNet.struct({ titleId = ByteNet.string }),
+		}),
+
+		--[[
+			server -> client. The result of an openCase, for the reveal. A
+			RECEIPT: the title (or the duplicate refund) is already written to
+			the profile by the time this is sent, so a client that drops it
+			loses the animation, never the title.
+		]]
+		caseOpened = ByteNet.definePacket({
+			value = ByteNet.struct({
+				caseId = ByteNet.string,
+				titleId = ByteNet.string,
+				duplicate = ByteNet.bool,
+				refund = ByteNet.uint32,
 			}),
 		}),
 
@@ -220,7 +266,14 @@ return ByteNet.defineNamespace(NAMESPACE, function()
 			value = ByteNet.struct({ mapId = ByteNet.string }),
 		}),
 
-		voteMode = ByteNet.definePacket({
+		-- The same shape for the other two ballots, one packet each, so each
+		-- ballot has its own rate limit (VoteService) and a click on one can
+		-- never be dropped for having followed a click on another.
+		voteGameMode = ByteNet.definePacket({
+			value = ByteNet.struct({ modeId = ByteNet.string }),
+		}),
+
+		voteTeamMode = ByteNet.definePacket({
 			value = ByteNet.struct({ modeId = ByteNet.string }),
 		}),
 
@@ -277,6 +330,9 @@ return ByteNet.defineNamespace(NAMESPACE, function()
 			value = ByteNet.struct({
 				slot = ByteNet.uint8,
 				direction = ByteNet.vec3,
+				-- How full the charge bar was at release, 0..1 (Config.Throw).
+				-- Clamped server-side; NaN is refused.
+				charge = ByteNet.float32,
 			}),
 		}),
 
@@ -320,6 +376,50 @@ return ByteNet.defineNamespace(NAMESPACE, function()
 				-- so the client skips the cone test.
 				closeRange = ByteNet.bool,
 			}),
+		}),
+
+		--[[
+			server -> client, to the stunned player only. A frag froze you.
+
+			Presentation only. The freeze itself is already applied on the
+			server (SprintService.stun owns WalkSpeed, jumping and turning), so
+			a client that drops this packet is still frozen; it just is not told.
+			Everyone else learns about the stun from the effect the server puts
+			on the character, which replicates without a packet.
+
+			endsAt is absolute server time, like respawnAt, so the countdown
+			cannot drift.
+		]]
+		stunned = ByteNet.definePacket({
+			value = ByteNet.struct({ endsAt = ByteNet.float64 }),
+		}),
+
+		--[[
+			server -> client, to the shocked player only. A shock grenade
+			slowed you and took your sprint away.
+
+			Presentation only, exactly like `stunned`: the slow is already
+			applied on the server (SprintService.slow), and everyone else sees
+			the arcs the server puts on the character. endsAt is absolute
+			server time.
+		]]
+		shocked = ByteNet.definePacket({
+			value = ByteNet.struct({ endsAt = ByteNet.float64 }),
+		}),
+
+		--[[
+			server -> client, to each player an impulse grenade launched. The
+			velocity is computed on the server (direction and falloff,
+			Config.Impulse); the client applies it to its own
+			HumanoidRootPart, because the client owns its character's physics
+			and a velocity the server wrote would be overwritten by the
+			client's next physics step.
+
+			Letting the client apply it concedes nothing: a client that owns
+			its character can already move it however it likes.
+		]]
+		impulse = ByteNet.definePacket({
+			value = ByteNet.struct({ velocity = ByteNet.vec3 }),
 		}),
 
 		--=====================================================================
@@ -375,74 +475,131 @@ return ByteNet.defineNamespace(NAMESPACE, function()
 		}),
 
 		--=====================================================================
-		-- DEVELOPER CONSOLE
+		-- ADMIN PANEL (AdminService / AdminController)
 		--=====================================================================
 
-		-- client -> server
-		devRequestSnapshot = ByteNet.definePacket({
-			value = ByteNet.struct({ targetUserId = ByteNet.float64 }),
-		}),
-
-		-- server -> client
-		devSnapshot = ByteNet.definePacket({
-			value = ByteNet.struct({
-				targetUserId = ByteNet.float64,
-				entries = ByteNet.array(ByteNet.struct({
-					path = ByteNet.array(ByteNet.string),
-					kind = ByteNet.string,
-					value = ByteNet.string,
-				})),
-			}),
-		}),
-
-		-- client -> server
-		devSet = ByteNet.definePacket({
-			value = ByteNet.struct({
-				targetUserId = ByteNet.float64,
-				path = ByteNet.array(ByteNet.string),
-				kind = ByteNet.string,
-				value = ByteNet.string,
-			}),
-		}),
-
-		-- server -> client
-		devResult = ByteNet.definePacket({
-			value = ByteNet.struct({ ok = ByteNet.bool, message = ByteNet.string }),
-		}),
-
 		--[[
-			server -> client. "Are you a developer?" -- answered BY the server,
-			never computed by the client.
+			server -> client. "Are you an admin?" -- answered BY the server,
+			never computed by the client (the admin list lives server-side and
+			ConfigService is server-only). It is not a trust boundary: `allowed`
+			only decides whether the panel and its menu button are drawn.
+			AdminService re-checks authority on every admin packet it receives.
 
-			This packet exists because ConfigService is server-only ("Attempting
-			to call its methods from a client script results in an error"), so the
-			client physically cannot read the developers list itself. It is not a
-			trust boundary: `allowed` only decides whether the console UI is drawn.
-			A client that forges it gains a UI and nothing else, because DevService
-			re-checks authority on every privileged packet it receives. The client
-			was never trusted before either -- it just used to compute the same
-			answer locally instead of being told.
-
-			Sent on join, and again to everyone whenever the config changes, which
-			is what makes adding a UserId in the dashboard take effect live.
+			Sent on join, and again to everyone whenever the developers config
+			changes, so a UserId added in the dashboard takes effect live.
 		]]
-		devAccess = ByteNet.definePacket({
+		adminAccess = ByteNet.definePacket({
 			value = ByteNet.struct({ allowed = ByteNet.bool }),
 		}),
 
 		--[[
-			client -> server. "Tell me my access." No payload -- the server only
-			needs to know WHO asked, and it gets that for free.
-
-			This exists because a push alone races: the server learns a player
-			joined before that player's LocalScripts have run, and a RemoteEvent
-			fired at a client with no listener yet is simply dropped, not queued.
-			A fresh joiner would silently never get a console. Asking from the
-			client's own Start() -- by which point Init() has registered the
-			listener -- is the one ordering that cannot lose the reply.
+			client -> server. "Tell me my access." A push alone races: the server
+			learns a player joined before that player's LocalScripts have run,
+			and a packet fired at a client with no listener yet is dropped, not
+			queued. Asking from the client's own Start() -- by which point Init()
+			has registered the listener -- is the one ordering that cannot lose
+			the reply.
 		]]
-		devRequestAccess = ByteNet.definePacket({
+		adminRequestAccess = ByteNet.definePacket({
 			value = ByteNet.nothing,
+		}),
+
+		--[[
+			client -> server. Look a player up by username or UserId, in this
+			server or not. Answered with adminProfile.
+		]]
+		adminLookup = ByteNet.definePacket({
+			value = ByteNet.struct({ query = ByteNet.string }),
+		}),
+
+		--[[
+			server -> client. One player's saved data, for the panel.
+
+			location is "Here" (in this server: edits apply now), "Elsewhere"
+			(in another server: edits are queued and apply within seconds),
+			"Offline" (edits apply on their next join) or "None" (no such player,
+			or they have never played). `data` is the profile as JSON -- the
+			panel only displays it, and every write is re-validated server-side.
+
+			userId is float64: newer UserIds are past what a uint32 can hold.
+		]]
+		adminProfile = ByteNet.definePacket({
+			value = ByteNet.struct({
+				userId = ByteNet.float64,
+				name = ByteNet.string,
+				location = ByteNet.string,
+				data = ByteNet.string,
+			}),
+		}),
+
+		--[[
+			client -> server. One data edit. `op` names it (AdminService's
+			EDIT_OPS), `key` is its target (a case id, a title id, a field
+			path) and `value` is always a string the server parses and
+			bounds-checks itself -- no client value reaches DataService as-is.
+		]]
+		adminEdit = ByteNet.definePacket({
+			value = ByteNet.struct({
+				userId = ByteNet.float64,
+				op = ByteNet.string,
+				key = ByteNet.string,
+				value = ByteNet.string,
+			}),
+		}),
+
+		-- client -> server. An action on a player who is in this server
+		-- (kill, stun, kick, give an item...). `arg` depends on the action.
+		adminPlayerAction = ByteNet.definePacket({
+			value = ByteNet.struct({
+				userId = ByteNet.float64,
+				action = ByteNet.string,
+				arg = ByteNet.string,
+			}),
+		}),
+
+		-- client -> server. Round control and announcements. a/b/c depend on
+		-- the action (a map id and two mode ids for a forced round).
+		adminServerAction = ByteNet.definePacket({
+			value = ByteNet.struct({
+				action = ByteNet.string,
+				a = ByteNet.string,
+				b = ByteNet.string,
+				c = ByteNet.string,
+			}),
+		}),
+
+		-- client -> server. "Send me the server state." Answered with adminState.
+		adminRequestState = ByteNet.definePacket({
+			value = ByteNet.nothing,
+		}),
+
+		--[[
+			server -> client. What the round loop is doing, what the next round
+			is forced to ("" = left to the vote), and the recent admin log. Only
+			to admins: the forced round and the log are not public.
+		]]
+		adminState = ByteNet.definePacket({
+			value = ByteNet.struct({
+				nextMap = ByteNet.string,
+				nextGameMode = ByteNet.string,
+				nextTeamMode = ByteNet.string,
+				nextSkipVote = ByteNet.bool,
+				log = ByteNet.array(ByteNet.string),
+			}),
+		}),
+
+		-- server -> client. How an admin request went, for the panel's status line.
+		adminResult = ByteNet.definePacket({
+			value = ByteNet.struct({ ok = ByteNet.bool, message = ByteNet.string }),
+		}),
+
+		--[[
+			server -> EVERY client. An admin announcement, shown on its own
+			screen above everything (AnnouncementController), so a player in
+			the menu sees it too -- a Net.notice only reaches the in-round HUD.
+		]]
+		announcement = ByteNet.definePacket({
+			value = ByteNet.struct({ message = ByteNet.string, from = ByteNet.string }),
 		}),
 	}
 end)

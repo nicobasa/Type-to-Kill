@@ -3,20 +3,23 @@
 	Thrown grenades: the physics, the fuse, and what detonation means.
 
 	THE SERVER OWNS THE PROJECTILE FROM HAND TO DETONATION. The client
-	contributes exactly one value -- a direction, because only it knows where
-	the camera is looking -- and the server builds the part, launches it, and
-	KEEPS network ownership (`:SetNetworkOwner(nil)`). Handing ownership to the
-	thrower is the obvious optimisation and it is also the exploit: the owner of
-	a part decides its CFrame, so a thrower would be able to walk a live
-	flashbang into the enemy spawn from across the map and have the server
-	replicate it for them. The cost of refusing is about one round-trip of lag on
-	the thrower's own view of their own grenade. That is a good trade.
+	contributes two values -- a direction, because only it knows where the
+	camera is looking, and how full the charge bar was -- and the server builds
+	the part and flies it. The flight is SIMULATED, not physics
+	(Modules/Ballistics.luau, Config.Throw): the part is anchored and moved
+	here every Heartbeat to where the simulation says, so no client ever owns
+	it. Client ownership would be the exploit: the owner of a part decides its
+	CFrame, so a thrower could walk a live flashbang into the enemy spawn from
+	across the map. The cost is about one round-trip of lag on the thrower's
+	own view of their own grenade. That is a good trade.
 
 	GRENADES NEVER DEAL DAMAGE. Not a balance decision to revisit -- the only way
 	to kill in this game is to type somebody's code, so nothing in this file
 	touches a Humanoid's Health. A flashbang sends a packet; smoke puts a cloud
 	in the world. Both change what a player can SEE, and seeing is what the
-	whole game is played with.
+	whole game is played with. The frag is the exception to "seeing": it
+	freezes enemies in place (SprintService.stun), so they cannot run or turn
+	their code away while somebody reads it. It still deals no damage.
 
 	WHY THE SMOKE CLOUD IS AN INSTANCE AND NOT A PACKET
 
@@ -44,19 +47,25 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
+local Ballistics = require(ServerStorage.Modules.Ballistics)
 local Config = require(ReplicatedStorage.Shared.Config)
 local Items = require(ReplicatedStorage.Shared.Items)
 local LoadoutService = require(script.Parent.LoadoutService)
 local Log = require(ReplicatedStorage.Shared.Log)
 local MapService = require(script.Parent.MapService)
+local Match = require(ReplicatedStorage.Shared.Match)
 local Net = require(ReplicatedStorage.Shared.Net)
 local ParticipantService = require(script.Parent.ParticipantService)
 local RateLimiter = require(ServerStorage.Modules.RateLimiter)
 local RoundService = require(script.Parent.RoundService)
+local SpawnService = require(script.Parent.SpawnService)
+local SprintService = require(script.Parent.SprintService)
+local TeamService = require(script.Parent.TeamService)
 
 local log = Log.new("GrenadeService")
 
@@ -88,13 +97,25 @@ local CLOUD_SEED_SIZE = Vector3.new(0.2, 0.2, 0.2)
 ]]
 local MIN_DIRECTION_MAGNITUDE = 1e-3
 
+--[[
+	Who threw it, captured when the fuse was lit. The team is read at the throw
+	rather than at the blast: the thrower can leave mid-fuse, and a grenade
+	must still know whose side it was on when it goes off.
+]]
+type Thrower = {
+	player: Player,
+	-- nil in Free For All, where there are no sides to spare.
+	team: Match.TeamId?,
+}
+
 type GrenadeKind = {
 	FuseDuration: number,
-	ThrowSpeed: number,
+	-- Stops dead on the first surface it touches instead of bouncing.
+	Sticky: boolean,
 	-- `scheduledGeneration` is the round generation the fuse was lit under; a
 	-- detonation with deferred steps of its own must not run them into a round
 	-- that has already been cleared.
-	detonate: (position: Vector3, scheduledGeneration: number) -> (),
+	detonate: (position: Vector3, scheduledGeneration: number, thrower: Thrower) -> (),
 }
 
 --[[
@@ -105,6 +126,13 @@ type GrenadeKind = {
 	the length of a smoke.
 ]]
 local liveParts: { [BasePart]: true } = {}
+
+-- Grenades in flight, and the simulated body each one follows. A subset of
+-- liveParts: a grenade leaves this at detonation, a cloud is never in it.
+local flights: { [BasePart]: Ballistics.Body } = {}
+-- The one Heartbeat that steps every flight; connected only while there is
+-- something in flight (TitleStyle.luau makes the same choice).
+local flightConnection: RBXScriptConnection? = nil
 
 --[[
 	Bumped every time the world is cleared. Every deferred step captures the
@@ -168,16 +196,14 @@ end
 	`:Clone()` brings the template's children with it, and a welded child part is
 	still a part. Left queryable it blocks the flashbang's own line-of-sight cast
 	-- the one thing this service promises a grenade in flight cannot do. Left
-	touchable it trips a pickup node on the way past. Left ANCHORED it makes
-	SetNetworkOwner throw, so the thrower loses the grenade to a decoration
-	somebody anchored in Studio. Setting these on the root alone makes the
-	comments below true of one part and false of the object.
+	touchable it trips a pickup node on the way past. Left ANCHORED, a child
+	stays where it was cloned while the root flies. Setting these on the root
+	alone makes the comments below true of one part and false of the object.
 
-	`canCollide` is optional because the two callers disagree for a reason: a
-	grenade's root IS its collision hull and its decorative children keep
-	whatever was authored (forcing a glow sphere solid would change how the
-	grenade bounces), while a cloud has to be non-solid all the way down -- a
-	vision blocker that also stops bodies is a wall.
+	`canCollide` is optional; both callers pass false today. A grenade's flight
+	is simulated (Ballistics), so its parts are only a picture, and a cloud
+	has to be non-solid all the way down -- a vision blocker that also stops
+	bodies is a wall.
 ]]
 local function applyAssemblyFlags(root: BasePart, anchored: boolean, canCollide: boolean?)
 	local parts: { BasePart } = { root }
@@ -308,17 +334,19 @@ local function createProjectile(itemId: string, definition: Items.ItemDefinition
 
 	part.Name = itemId
 	--[[
-		Unanchored, and out of every raycast and every Touched event in the game,
-		across the whole clone. Anchored is asserted rather than assumed because a
-		designer who anchors the template in Studio would otherwise get a grenade
-		that hangs in the air AND a thrown error out of SetNetworkOwner; the query
-		and touch flags because a live grenade must not block the flashbang's own
-		line-of-sight test and must not trip a pickup node on the way past.
+		Out of every raycast, every Touched event and all collision, across the
+		whole clone: the flight is simulated (Ballistics), so the part is only
+		the picture of where the grenade is. Queryable, it would block the
+		flashbang's own line-of-sight test and the simulation's sweeps;
+		touchable, it would trip a pickup node on the way past; solid, it would
+		shove a player it is carried through.
+
+		The ROOT is anchored and moved by CFrame each step. Its children are
+		left unanchored so their welds carry them along with it -- an anchored
+		child would stay behind where it was cloned.
 	]]
-	applyAssemblyFlags(part, false)
-	-- Only the root: the template's own children keep the collision the designer
-	-- gave them. See applyAssemblyFlags.
-	part.CanCollide = true
+	applyAssemblyFlags(part, false, false)
+	part.Anchored = true
 	return part
 end
 
@@ -331,7 +359,7 @@ end
 	test is for WALLS, and a flash that a body absorbs is a flash whose
 	behaviour depends on where somebody else happens to be standing.
 ]]
-local function detonateFlash(position: Vector3, _scheduledGeneration: number)
+local function detonateFlash(position: Vector3, _scheduledGeneration: number, _thrower: Thrower)
 	local filter: { Instance } = {}
 	for _, other in Players:GetPlayers() do
 		local character = other.Character
@@ -395,7 +423,7 @@ end
 	same cloud, and it is worth paying: a client-side animation would be a
 	client-side decision about when vision is blocked.
 ]]
-local function detonateSmoke(position: Vector3, scheduledGeneration: number)
+local function detonateSmoke(position: Vector3, scheduledGeneration: number, _thrower: Thrower)
 	local template = assetPart({ "SmokeCloud" })
 	local cloud: BasePart
 
@@ -450,6 +478,382 @@ local function detonateSmoke(position: Vector3, scheduledGeneration: number)
 	end)
 end
 
+local STUN_EFFECT_NAME = "StunEffect"
+-- Electric yellow: loud against every map palette, and not the cyan the UI
+-- uses for "this is yours" or the red and blue the teams use.
+local STUN_COLOR = Color3.fromRGB(255, 221, 64)
+
+--[[
+	What everyone else sees on a stunned player: yellow sparks crackling over
+	the torso for as long as the stun lasts.
+
+	On the torso, not the head, on purpose. The code plate hangs in front of
+	the head, and a stun is exactly when enemies are trying to read it. An
+	effect over the plate would make a stun protect the player it hit.
+
+	Built on the SERVER and parented into the character, so it replicates to
+	everyone with no packet, and it dies with the body if they die mid-stun.
+	ServerStorage.Assets.StunEffect overrides the fallback when it is authored
+	(any Instance; it is cloned into the HumanoidRootPart).
+]]
+local function attachStunEffect(character: Model, duration: number)
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root == nil or not root:IsA("BasePart") then
+		return
+	end
+
+	-- One effect per body. A second frag extends the stun; it should not
+	-- double the sparks.
+	local existing = root:FindFirstChild(STUN_EFFECT_NAME)
+	if existing ~= nil then
+		existing:Destroy()
+	end
+
+	local assets = ServerStorage:FindFirstChild("Assets")
+	local template = if assets ~= nil then assets:FindFirstChild(STUN_EFFECT_NAME) else nil
+	local effect: Instance
+	if template ~= nil then
+		effect = template:Clone()
+	else
+		local sparks = Instance.new("ParticleEmitter")
+		sparks.Color = ColorSequence.new(STUN_COLOR)
+		sparks.LightEmission = 1
+		sparks.LightInfluence = 0
+		sparks.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.35),
+			NumberSequenceKeypoint.new(1, 0),
+		})
+		sparks.Lifetime = NumberRange.new(0.3, 0.6)
+		sparks.Rate = 40
+		sparks.Speed = NumberRange.new(3, 6)
+		sparks.SpreadAngle = Vector2.new(180, 180)
+		-- Spawned over the root part's surface, which is the torso's footprint.
+		sparks.Shape = Enum.ParticleEmitterShape.Box
+		sparks.ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface
+		effect = sparks
+	end
+
+	effect.Name = STUN_EFFECT_NAME
+	effect.Parent = root
+
+	task.delay(duration, function()
+		-- Only if it is still this effect: a second frag replaced it with one
+		-- of its own that must run its full length.
+		if effect.Parent == root then
+			effect:Destroy()
+		end
+	end)
+end
+
+--[[
+	Every enemy close enough, with a clear line to the blast, is frozen for
+	Config.Frag.StunDuration.
+
+	Never the thrower, and never the thrower's team. The team was read when the
+	fuse was lit (Thrower). In a team mode with no team to read, nobody is
+	stunned: refusing the whole blast is the side that cannot stun a teammate.
+
+	Line of sight to the head OR the root: either is enough, so a waist-high
+	crate between you and the blast does not save you, and a wall does. Bodies
+	do not count as cover, for the same reason detonateFlash gives.
+
+	A player still under spawn protection is skipped, as a kill would be
+	(KillService). Freezing someone on the spawn for three seconds is a
+	spawn-camp.
+]]
+local function enemiesInBlast(position: Vector3, radius: number, thrower: Thrower): { Player }
+	local caught: { Player } = {}
+	local usesTeams = RoundService.getTeamMode().UsesTeams
+	if usesTeams and thrower.team == nil then
+		log.debug(`blast from {thrower.player.Name} with no team -- hit nobody`)
+		return caught
+	end
+
+	local filter: { Instance } = {}
+	for _, other in Players:GetPlayers() do
+		local character = other.Character
+		if character ~= nil then
+			table.insert(filter, character)
+		end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = filter
+	params.IgnoreWater = true
+
+	local function clearTo(point: Vector3): boolean
+		local offset = point - position
+		if offset.Magnitude <= MIN_DIRECTION_MAGNITUDE then
+			return true
+		end
+		return Workspace:Raycast(position, offset, params) == nil
+	end
+
+	for _, other in Players:GetPlayers() do
+		if other == thrower.player then
+			continue
+		end
+		if usesTeams and TeamService.getTeam(other) == thrower.team then
+			continue
+		end
+		if not ParticipantService.isPlaying(other) or SpawnService.isProtected(other) then
+			continue
+		end
+
+		local humanoid = livingHumanoid(other)
+		local root = if humanoid ~= nil then humanoid.RootPart else nil
+		local eye = eyePosition(other)
+		if root == nil or eye == nil then
+			continue
+		end
+
+		-- The nearer of head and root, so a blast at someone's feet counts
+		-- as a blast at their feet.
+		local distance = math.min((eye - position).Magnitude, (root.Position - position).Magnitude)
+		if distance > radius then
+			continue
+		end
+		if not clearTo(eye) and not clearTo(root.Position) then
+			continue
+		end
+
+		table.insert(caught, other)
+	end
+	return caught
+end
+
+local function detonateFrag(position: Vector3, _scheduledGeneration: number, thrower: Thrower)
+	local endsAt = Workspace:GetServerTimeNow() + Config.Frag.StunDuration
+	for _, other in enemiesInBlast(position, Config.Frag.Radius, thrower) do
+		if SprintService.stun(other, Config.Frag.StunDuration) then
+			local character = other.Character
+			if character ~= nil then
+				attachStunEffect(character, Config.Frag.StunDuration)
+			end
+			Net.stunned.sendTo({ endsAt = endsAt }, other)
+		end
+	end
+end
+
+local SHOCK_EFFECT_NAME = "ShockEffect"
+-- Electric blue: the item's slot colour, and clearly not the frag's yellow.
+local SHOCK_COLOR = Color3.fromRGB(90, 190, 255)
+local SHOCK_CORE = Color3.fromRGB(225, 245, 255)
+-- The blast: a sphere that grows to the Radius, then fades.
+local SHOCK_BLAST_GROW = 0.3
+local SHOCK_BLAST_FADE = 0.4
+
+--[[
+	Electricity on a shocked player, for everyone to see: fast blue-white
+	arcs crackling off the torso and a steady blue glow. Built on the SERVER
+	and parented into the character, so it replicates with no packet and dies
+	with the body -- attachStunEffect's reasoning, and on the torso for the
+	same reason (never over the code plate). ServerStorage.Assets.ShockEffect
+	overrides the fallback when it is authored.
+
+	The glow is steady, not flickering: a light that pulsed would flash
+	(GAMEPLAY.md, the photosensitivity rule).
+]]
+local function attachShockEffect(character: Model, duration: number)
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root == nil or not root:IsA("BasePart") then
+		return
+	end
+
+	-- One effect per body; a second shock restarts it.
+	local existing = root:FindFirstChild(SHOCK_EFFECT_NAME)
+	if existing ~= nil then
+		existing:Destroy()
+	end
+
+	local assets = ServerStorage:FindFirstChild("Assets")
+	local template = if assets ~= nil then assets:FindFirstChild(SHOCK_EFFECT_NAME) else nil
+	local effect: Instance
+	if template ~= nil then
+		effect = template:Clone()
+	else
+		local folder = Instance.new("Folder")
+
+		-- The arcs: short, fast, stretched streaks.
+		local arcs = Instance.new("ParticleEmitter")
+		arcs.Name = "Arcs"
+		arcs.Color = ColorSequence.new(SHOCK_CORE, SHOCK_COLOR)
+		arcs.LightEmission = 1
+		arcs.LightInfluence = 0
+		arcs.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.25),
+			NumberSequenceKeypoint.new(1, 0),
+		})
+		arcs.Squash = NumberSequence.new(-1.5)
+		arcs.Lifetime = NumberRange.new(0.08, 0.18)
+		arcs.Rate = 90
+		arcs.Speed = NumberRange.new(10, 18)
+		arcs.SpreadAngle = Vector2.new(180, 180)
+		arcs.Orientation = Enum.ParticleOrientation.VelocityParallel
+		arcs.Shape = Enum.ParticleEmitterShape.Box
+		arcs.ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface
+		arcs.Parent = folder
+
+		-- Sparks: small bright points that hang a little longer.
+		local sparks = Instance.new("ParticleEmitter")
+		sparks.Name = "Sparks"
+		sparks.Color = ColorSequence.new(SHOCK_COLOR)
+		sparks.LightEmission = 1
+		sparks.LightInfluence = 0
+		sparks.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.18),
+			NumberSequenceKeypoint.new(1, 0),
+		})
+		sparks.Lifetime = NumberRange.new(0.25, 0.45)
+		sparks.Rate = 35
+		sparks.Speed = NumberRange.new(2, 5)
+		sparks.SpreadAngle = Vector2.new(180, 180)
+		sparks.Shape = Enum.ParticleEmitterShape.Box
+		sparks.ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface
+		sparks.Parent = folder
+
+		local glow = Instance.new("PointLight")
+		glow.Name = "Glow"
+		glow.Color = SHOCK_COLOR
+		glow.Brightness = 1.5
+		glow.Range = 8
+		glow.Parent = folder
+
+		effect = folder
+	end
+
+	effect.Name = SHOCK_EFFECT_NAME
+	effect.Parent = root
+
+	task.delay(duration, function()
+		if effect.Parent == root then
+			effect:Destroy()
+		end
+	end)
+end
+
+--[[
+	A blast everyone sees: an energy sphere of `color` that grows to `radius`
+	in SHOCK_BLAST_GROW and fades out over SHOCK_BLAST_FADE. One swell, never a
+	strobe. Tracked in liveParts so a round ending mid-blast takes it. The
+	shock's is blue, the impulse's magenta.
+]]
+local function playBlast(position: Vector3, scheduledGeneration: number, name: string, radius: number, color: Color3)
+	local sphere = Instance.new("Part")
+	sphere.Name = name
+	sphere.Shape = Enum.PartType.Ball
+	sphere.Material = Enum.Material.ForceField
+	sphere.Color = color
+	sphere.Transparency = 0.1
+	sphere.Size = Vector3.new(1, 1, 1)
+	sphere.CFrame = CFrame.new(position)
+	applyAssemblyFlags(sphere, true, false)
+	sphere.Parent = grenadeParent()
+	liveParts[sphere] = true
+
+	local diameter = radius * 2
+	TweenService:Create(sphere, TweenInfo.new(SHOCK_BLAST_GROW, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(diameter, diameter, diameter),
+	}):Play()
+
+	task.delay(SHOCK_BLAST_GROW, function()
+		if generation ~= scheduledGeneration or sphere.Parent == nil then
+			return
+		end
+		TweenService:Create(sphere, TweenInfo.new(SHOCK_BLAST_FADE), { Transparency = 1 }):Play()
+		task.delay(SHOCK_BLAST_FADE, function()
+			liveParts[sphere] = nil
+			sphere:Destroy()
+		end)
+	end)
+end
+
+--[[
+	Every enemy close enough, with a clear line to the blast, is slowed and
+	loses their sprint for Config.Shock.SlowDuration -- the same targeting as
+	the frag (enemiesInBlast), over the shock's wider radius.
+]]
+local function detonateShock(position: Vector3, scheduledGeneration: number, thrower: Thrower)
+	playBlast(position, scheduledGeneration, "ShockBlast", Config.Shock.Radius, SHOCK_COLOR)
+
+	local duration = Config.Shock.SlowDuration
+	local endsAt = Workspace:GetServerTimeNow() + duration
+	for _, other in enemiesInBlast(position, Config.Shock.Radius, thrower) do
+		if SprintService.slow(other, duration) then
+			local character = other.Character
+			if character ~= nil then
+				attachShockEffect(character, duration)
+			end
+			Net.shocked.sendTo({ endsAt = endsAt }, other)
+		end
+	end
+end
+
+local IMPULSE_COLOR = Color3.fromRGB(235, 90, 220)
+
+--[[
+	The launch one player gets from an impulse blast at `position`: along the
+	line from the blast to their HumanoidRootPart, at a speed that falls off
+	from Config.Impulse.MaxSpeed at the blast to MinSpeed at the edge of the
+	Radius. Straight up when they are (almost) exactly on top of it.
+]]
+local function impulseVelocity(position: Vector3, rootPosition: Vector3): Vector3
+	local impulse = Config.Impulse
+	local offset = rootPosition - position
+	local distance = offset.Magnitude
+	local direction = if distance > MIN_DIRECTION_MAGNITUDE then offset / distance else Vector3.new(0, 1, 0)
+	local closeness = 1 - math.clamp(distance / impulse.Radius, 0, 1)
+	local speed = impulse.MinSpeed + (impulse.MaxSpeed - impulse.MinSpeed) * closeness
+	return direction * speed
+end
+
+--[[
+	The impulse grenade's blast: every player in the round within
+	Config.Impulse.Radius -- the thrower and teammates too, because it is a
+	movement tool -- with a clear line from the blast to their root is sent
+	flying away from it (impulseVelocity).
+
+	The velocity is computed here and APPLIED by the player's own client
+	(Net.impulse, ImpulseController): the client owns its character's physics,
+	and a velocity written by the server would be overwritten by the client's
+	next step. Nobody is ragdolled or loses control; it is only a push.
+]]
+local function detonateImpulse(position: Vector3, scheduledGeneration: number, _thrower: Thrower)
+	playBlast(position, scheduledGeneration, "ImpulseBlast", Config.Impulse.Radius, IMPULSE_COLOR)
+
+	local filter: { Instance } = {}
+	for _, other in Players:GetPlayers() do
+		local character = other.Character
+		if character ~= nil then
+			table.insert(filter, character)
+		end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = filter
+	params.IgnoreWater = true
+
+	for _, other in Players:GetPlayers() do
+		if not ParticipantService.isPlaying(other) then
+			continue
+		end
+		local humanoid = livingHumanoid(other)
+		local root = if humanoid ~= nil then humanoid.RootPart else nil
+		if root == nil then
+			continue
+		end
+		local offset = root.Position - position
+		if offset.Magnitude > Config.Impulse.Radius then
+			continue
+		end
+		-- A wall between the blast and the player shields them.
+		if offset.Magnitude > MIN_DIRECTION_MAGNITUDE and Workspace:Raycast(position, offset, params) ~= nil then
+			continue
+		end
+		Net.impulse.sendTo({ velocity = impulseVelocity(position, root.Position) }, other)
+	end
+end
+
 --[[
 	What each throwable DOES. Items.luau is the catalog -- what exists, what it
 	is called, what colour its slot is -- and this is the behaviour; an item in
@@ -459,15 +863,100 @@ end
 local GRENADES: { [string]: GrenadeKind } = {
 	Flashbang = {
 		FuseDuration = Config.Flash.FuseDuration,
-		ThrowSpeed = Config.Flash.ThrowSpeed,
+		Sticky = false,
 		detonate = detonateFlash,
 	},
 	SmokeGrenade = {
 		FuseDuration = Config.Smoke.FuseDuration,
-		ThrowSpeed = Config.Smoke.ThrowSpeed,
+		Sticky = false,
 		detonate = detonateSmoke,
 	},
+	FragGrenade = {
+		FuseDuration = Config.Frag.FuseDuration,
+		Sticky = false,
+		detonate = detonateFrag,
+	},
+	ShockGrenade = {
+		FuseDuration = Config.Shock.FuseDuration,
+		Sticky = false,
+		detonate = detonateShock,
+	},
+	ImpulseGrenade = {
+		FuseDuration = Config.Impulse.FuseDuration,
+		Sticky = true,
+		detonate = detonateImpulse,
+	},
 }
+
+--[[
+	What a grenade in flight can hit: the world, never a body. Characters are
+	excluded because a grenade that bounces off a moving player is a grenade
+	whose landing depends on where somebody else happened to step -- and the
+	thrower's own body would otherwise catch the throw at the hand. Grenades
+	and clouds are CanQuery false (applyAssemblyFlags), so they are skipped
+	without being listed.
+]]
+local function flightParams(): RaycastParams
+	local characters: { Instance } = {}
+	for _, other in Players:GetPlayers() do
+		local character = other.Character
+		if character ~= nil then
+			table.insert(characters, character)
+		end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = characters
+	return params
+end
+
+local function stepFlights(dt: number)
+	local params = flightParams()
+	for part, body in flights do
+		if part.Parent == nil then
+			-- The map went, and the part with it. The fuse still holds it and
+			-- tidies liveParts up.
+			flights[part] = nil
+			continue
+		end
+		Ballistics.step(body, dt, params)
+		part.CFrame = CFrame.new(body.position) * body.spin
+		if body.resting then
+			-- Where it will go off. Nothing moves it from here.
+			flights[part] = nil
+		end
+	end
+
+	if next(flights) == nil then
+		local connection = flightConnection
+		flightConnection = nil
+		if connection ~= nil then
+			connection:Disconnect()
+		end
+	end
+end
+
+local function startFlight(part: BasePart, body: Ballistics.Body)
+	flights[part] = body
+	if flightConnection == nil then
+		flightConnection = RunService.Heartbeat:Connect(stepFlights)
+	end
+end
+
+--[[
+	Where the grenade leaves the hand: MUZZLE_OFFSET ahead of the eyes, or
+	short of whatever is in the way. A player throwing with their face against
+	a wall would otherwise start the grenade on the far side of it.
+]]
+local function launchPosition(eye: Vector3, direction: Vector3): Vector3
+	local reach = direction * MUZZLE_OFFSET
+	local blocked = Workspace:Raycast(eye, reach, flightParams())
+	if blocked == nil then
+		return eye + reach
+	end
+	local clearance = Config.Throw.ProjectileRadius + 0.05
+	return eye + direction * math.max(blocked.Distance - clearance, 0)
+end
 
 --[[
 	Every grenade and cloud, gone. Called when the round leaves RoundActive.
@@ -482,9 +971,11 @@ local function clearWorld()
 		part:Destroy()
 	end
 	table.clear(liveParts)
+	-- The Heartbeat sees an empty table on its next step and disconnects.
+	table.clear(flights)
 end
 
-local function onThrow(data: { slot: number, direction: Vector3 }, player: Player)
+local function onThrow(data: { slot: number, direction: Vector3, charge: number }, player: Player)
 	-- First, before any other work and before any logging: the only safe
 	-- response to a flood is to drop it having spent nothing (RateLimiter.luau).
 	if not throwLimit.allow(player) then
@@ -523,6 +1014,15 @@ local function onThrow(data: { slot: number, direction: Vector3 }, player: Playe
 		return
 	end
 
+	-- NaN first: it fails every comparison, so a clamp alone would pass it
+	-- straight into the speed (quality-gate.md trap #8). Out-of-range is
+	-- clamped rather than refused; a full charge is legal anyway.
+	local charge = data.charge
+	if charge ~= charge then
+		return
+	end
+	charge = math.clamp(charge, 0, 1)
+
 	--[[
 		Peek, validate, then consume. consume() is destructive and there is no
 		put-back, so an empty slot -- or an item with no throw behaviour -- has to
@@ -541,34 +1041,18 @@ local function onThrow(data: { slot: number, direction: Vector3 }, player: Playe
 		return
 	end
 
+	local throw = Config.Throw
+	local speed = throw.MinSpeed + (throw.MaxSpeed - throw.MinSpeed) * charge
+	local start = launchPosition(root.Position + EYE_OFFSET, direction)
+
 	local part = createProjectile(itemId, Items.byId(itemId))
-	part.CFrame = CFrame.new(root.Position + EYE_OFFSET + direction * MUZZLE_OFFSET)
+	part.CFrame = CFrame.new(start)
 	part.Parent = grenadeParent()
 	liveParts[part] = true
+	-- The camera's direction, exactly: looking up throws up.
+	startFlight(part, Ballistics.new(start, direction * speed, grenade.Sticky))
 
-	-- After parenting, not before: a part outside the world belongs to no
-	-- assembly, and a velocity written to one that does not exist yet is
-	-- discarded silently -- the grenade then simply drops.
-	part.AssemblyLinearVelocity = direction * grenade.ThrowSpeed
-
-	--[[
-		THE LINE THIS SERVICE EXISTS FOR. nil means "the server simulates it",
-		which is what stops the thrower from steering, stopping or teleporting
-		their own grenade.
-
-		pcall'd because SetNetworkOwner throws on an anchored assembly, and the
-		one way that happens is a Studio-authored template welded to something
-		anchored. Losing the grenade is the right outcome there -- what must not
-		happen is the throw handler dying halfway and leaving a part in flight
-		that the thrower owns.
-	]]
-	local owned = pcall(part.SetNetworkOwner, part, nil)
-	if not owned then
-		log.warn(`{itemId} could not be server-owned (an anchored asset?) -- destroyed instead of client-owned`)
-		liveParts[part] = nil
-		part:Destroy()
-		return
-	end
+	local thrower: Thrower = { player = player, team = TeamService.getTeam(player) }
 
 	local scheduledGeneration = generation
 	task.delay(grenade.FuseDuration, function()
@@ -586,9 +1070,10 @@ local function onThrow(data: { slot: number, direction: Vector3 }, player: Playe
 		-- detonation can see the grenade that caused it.
 		local position = part.Position
 		liveParts[part] = nil
+		flights[part] = nil
 		part:Destroy()
 
-		grenade.detonate(position, scheduledGeneration)
+		grenade.detonate(position, scheduledGeneration, thrower)
 	end)
 end
 
@@ -612,6 +1097,51 @@ function GrenadeService.Init()
 			clearWorld()
 		end
 	end)
+end
+
+--[[
+	A frag's stun on one player, without the frag: the freeze, the sparks
+	everyone sees, and the STUNNED warning on their own screen. For the admin
+	panel, so an admin stun looks and behaves exactly like a real one rather
+	than being a bare freeze nobody can see. False if there was no living body
+	to stun.
+]]
+function GrenadeService.stunPlayer(player: Player, duration: number): boolean
+	-- A NaN or negative duration would pin or skip the freeze (trap #8).
+	if duration ~= duration or duration <= 0 then
+		return false
+	end
+	if not SprintService.stun(player, duration) then
+		return false
+	end
+	local character = player.Character
+	if character ~= nil then
+		attachStunEffect(character, duration)
+	end
+	Net.stunned.sendTo({ endsAt = Workspace:GetServerTimeNow() + duration }, player)
+	return true
+end
+
+--[[
+	A shock grenade's effect on one player, without the grenade: the slow and
+	lost sprint, the arcs everyone sees, and the SHOCKED warning on their own
+	screen. For the admin panel, like stunPlayer. False if there was no living
+	body to shock.
+]]
+function GrenadeService.shockPlayer(player: Player, duration: number): boolean
+	-- A NaN or negative duration would pin or skip the slow (trap #8).
+	if duration ~= duration or duration <= 0 then
+		return false
+	end
+	if not SprintService.slow(player, duration) then
+		return false
+	end
+	local character = player.Character
+	if character ~= nil then
+		attachShockEffect(character, duration)
+	end
+	Net.shocked.sendTo({ endsAt = Workspace:GetServerTimeNow() + duration }, player)
+	return true
 end
 
 function GrenadeService.Start()

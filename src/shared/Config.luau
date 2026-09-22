@@ -58,7 +58,13 @@ local Config = {
 		already lost it (Validate.code enforces the shape).
 	]]
 	Code = {
-		Digits = 4,
+		--[[
+			There is no fixed code length: it is the round's ruleset
+			(Config.GameModes[id].CodeDigits), published in the round replica
+			as GameModeId. Read it through RoundService.getCodeDigits on the
+			server and MatchController.getCodeDigits on the client, never by
+			caching a number at module load -- it changes between rounds.
+		]]
 
 		--[[
 			How close another player has to be before the server will tell you
@@ -104,9 +110,65 @@ local Config = {
 		EnemyAvoidRadius = 40,
 	},
 
-	Modes = {
-		TeamDeathmatch = {
+	--[[
+		The rulesets (Match.GAME_MODES), by id. Extreme is Standard with twice
+		the digits: eight to read and type instead of four, off the same plate,
+		so every code is legible from about half as far away. That is the whole
+		difference, and it is meant to be.
+
+		Adrenaline is Standard with a boosted sprint: walking is the normal
+		pace, sprinting is faster than normal, and stamina never drains, so
+		the sprint never stops. The stamina bar is drawn as a colourful boost
+		while it runs (StaminaController).
+
+		WalkSpeed / SprintSpeed are the Humanoid speeds for the ruleset, written
+		only by SprintService. InfiniteStamina turns the drain off on both
+		sides (SprintService, and StaminaController's prediction).
+
+		SignWidthScale widens the headband's plate (and the fallback billboard)
+		for the ruleset, so a longer code still fits on ONE line at the SAME
+		text size as four digits. The label is TextScaled, so on a plate of the
+		original width eight digits would shrink instead. 2.1 is measured for
+		"1234 5678" in GothamBlack: eight digit widths plus the group space is
+		about 2.1 times the width of four.
+	]]
+	GameModes = {
+		Standard = {
+			CodeDigits = 4,
+			SignWidthScale = 1,
+			WalkSpeed = 16,
+			SprintSpeed = 30,
+			InfiniteStamina = false,
+		},
+		Extreme = {
+			CodeDigits = 8,
+			SignWidthScale = 2.1,
+			WalkSpeed = 16,
+			SprintSpeed = 30,
+			InfiniteStamina = false,
+		},
+		Adrenaline = {
+			CodeDigits = 4,
+			SignWidthScale = 1,
+			WalkSpeed = 16,
+			SprintSpeed = 40,
+			InfiniteStamina = true,
+		},
+	},
+
+	--[[
+		The team modes (Match.TEAM_MODES), by id. The key MUST equal the mode
+		id: HUDController and ScoreService look the goal up by it.
+
+		Four teams split the lobby four ways, so each side scores more slowly
+		than in two teams; its goal is lower to keep rounds about as long.
+	]]
+	TeamModes = {
+		TwoTeams = {
 			KillGoal = 100,
+		},
+		FourTeams = {
+			KillGoal = 60,
 		},
 		FreeForAll = {
 			KillGoal = 30,
@@ -114,20 +176,13 @@ local Config = {
 	},
 
 	Teams = {
-		-- Max allowed |Red - Blue|. The larger team locks at this difference.
+		-- Max allowed difference between the largest and the smallest team the
+		-- mode plays with. A team that would widen it past this locks.
 		MaxImbalance = 2,
 	},
 
 	Voting = {
 		MapChoices = 3,
-		-- The UI is built for three columns even though there are two modes
-		-- today, so a third mode needs no layout work.
-		MaxModeChoices = 3,
-	},
-
-	Movement = {
-		WalkSpeed = 16,
-		SprintSpeed = 30,
 	},
 
 	--[[
@@ -174,7 +229,6 @@ local Config = {
 		ViewConeDegrees = 120,
 		FullDuration = 0.5,
 		FadeDuration = 2,
-		ThrowSpeed = 70,
 	},
 
 	Smoke = {
@@ -184,11 +238,115 @@ local Config = {
 		-- a 14-stud radius is a 28-stud cloud -- big enough to break a sightline
 		-- rather than decorate one.
 		Radius = 14,
-		ThrowSpeed = 70,
 		-- How long the cloud takes to bloom in and to dissipate out. Inside
 		-- Duration, not added to it.
 		GrowDuration = 1,
 		FadeDuration = 2,
+	},
+
+	--[[
+		The frag. No damage, like every grenade in this game: it stuns. Every
+		enemy inside Radius with a clear line to the blast is frozen in place
+		for StunDuration seconds (SprintService.stun). Teammates and the
+		thrower are never affected.
+
+		Radius sits between the smoke cloud (14) and the flash's close band
+		(30): wide enough that a frag landing near a pair catches both, small
+		enough that it has to be thrown at someone rather than into a room.
+
+		A stunned player also cannot type a code (KillService refuses it, and
+		TypeModeController says why), so a stun is also three seconds in which
+		they cannot kill anyone.
+	]]
+	Frag = {
+		FuseDuration = 1.6,
+		Radius = 20,
+		StunDuration = 3,
+	},
+
+	--[[
+		The shock grenade. Thrown and fused like the frag, and it picks its
+		targets the same way (enemies only, line of sight, never someone under
+		spawn protection), over a wider Radius. It does not freeze: every
+		enemy it catches is SLOWED to SlowSpeed for SlowDuration seconds --
+		clearly slower than walking (Config.GameModes WalkSpeed, 16) without
+		being a crawl -- and cannot sprint at all until it wears off. A second
+		shock restarts the slow at its full length; slows never stack.
+	]]
+	Shock = {
+		FuseDuration = 1.6,
+		Radius = 30,
+		SlowDuration = 3,
+		SlowSpeed = 9,
+	},
+
+	--[[
+		The impulse grenade: a movement tool. It STICKS to the first surface it
+		touches (Config.Throw's flight, stopped dead on contact) and, when the
+		fuse runs out, launches every player within Radius -- the thrower and
+		teammates included, on purpose, so it can be used to fly -- straight
+		away from it: along the line from the grenade to their
+		HumanoidRootPart. Standing right above it sends you straight up.
+
+		Launch speed falls off with distance: MaxSpeed at the grenade, MinSpeed
+		at the edge of Radius. A player on the ground gets at least GroundLift
+		of upward speed so the floor's grip cannot swallow a sideways launch; a
+		player already in the air gets the launch exactly as computed. No
+		ragdoll and no loss of control: it is only a change of velocity.
+
+		A wall between the grenade and a player blocks the launch, like every
+		other blast here.
+	]]
+	Impulse = {
+		FuseDuration = 1.6,
+		Radius = 30,
+		MaxSpeed = 150,
+		MinSpeed = 35,
+		GroundLift = 35,
+	},
+
+	--[[
+		How every grenade flies. One table for all of them: the three kinds
+		differ in what they do when they go off, not in how they are thrown.
+
+		CHARGE. Holding the throw input fills a bar beside the crosshair over
+		ChargeTime seconds; releasing throws at a speed between MinSpeed (a quick
+		tap -- the throw the game has always had) and MaxSpeed (a full second's
+		hold). The client reports only how full the bar was, 0..1, and the server
+		clamps it: a full-strength throw is something anybody can do by holding
+		for a second, so a forged 1.0 gains nothing.
+
+		THE FLIGHT IS SIMULATED, NOT PHYSICS (server Modules/Ballistics.luau).
+		Gravity is Workspace.Gravity; collisions are found by sweeping a sphere
+		of ProjectileRadius along the path with Spherecast, so a grenade can
+		never tunnel through a thin wall at speed.
+
+		  Restitution      the share of the speed INTO a surface that comes back
+		                   out of it on a bounce (0 dead stop, 1 perfect bounce).
+		  BounceFriction   the share of the speed ALONG a surface kept through a
+		                   bounce. Below 1 is what makes a grenade that hits the
+		                   floor at a shallow angle skid to a stop instead of
+		                   skating off at nearly full speed.
+		  RollDeceleration studs/s^2 lost while rolling on the ground. High on
+		                   purpose: a grenade should settle within a few studs of
+		                   where it lands, not roll across the map.
+		  SettleSpeed      a bounce slower than this does not bounce at all; the
+		                   grenade stays on the surface and rolls. Stops the
+		                   endless micro-hops a pure restitution model produces.
+
+		BarDelay hides the bar for a quick tap, so a tap does not flash the bar
+		on screen for a single frame.
+	]]
+	Throw = {
+		MinSpeed = 70,
+		MaxSpeed = 140,
+		ChargeTime = 1,
+		BarDelay = 0.1,
+		ProjectileRadius = 0.45,
+		Restitution = 0.35,
+		BounceFriction = 0.55,
+		RollDeceleration = 60,
+		SettleSpeed = 6,
 	},
 
 	Pickups = {
@@ -204,7 +362,13 @@ local Config = {
 		KillCash = 10,
 		KillExperience = 25,
 
-		TeamDeathmatch = {
+		--[[
+			Every team mode, two or four sides. Win is sole first place; Draw is
+			a tie for first; everything else is a Loss. With four teams that is
+			deliberately blunt: second of four earns what last of four does, so
+			the only thing worth playing for is first.
+		]]
+		Teams = {
 			WinCash = 150,
 			WinExperience = 300,
 			DrawCash = 100,
@@ -242,6 +406,9 @@ local Config = {
 		JoinRequest = 0.5,
 		ItemAction = 0.2,
 		SettingWrite = 0.25,
+		-- Buying, opening and equipping (CosmeticsService). One limiter each,
+		-- so buying a case and then opening it are not the same budget.
+		ShopAction = 0.3,
 	},
 }
 

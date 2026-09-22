@@ -63,9 +63,10 @@ export type Standing = {
 
 local playerScores: { [Player]: Score } = {}
 
--- Both keys are always present, so getTeamScore never has to answer for a
--- missing one. Free For All simply never increments either.
-local teamScores: { [Match.TeamId]: number } = { Red = 0, Blue = 0 }
+-- Every team's key is always present, so getTeamScore never has to answer for
+-- a missing one. Teams the round does not play with, and Free For All, simply
+-- never increment theirs.
+local teamScores: { [Match.TeamId]: number } = { Red = 0, Blue = 0, Green = 0, Yellow = 0 }
 
 local ScoreService = {}
 
@@ -101,15 +102,10 @@ local function publishTeamScore(team: Match.TeamId)
 	RoundService.writeScores(values)
 end
 
---[[
-	The goal is selected by UsesTeams rather than by comparing the mode id to a
-	string literal (Match.luau says to read the flag, never the id). The
-	assumption that buys: exactly one team mode and one solo mode. A third mode
-	makes this branch wrong, and the fix then is a KillGoal field on GameMode,
-	not a longer if.
-]]
-local function killGoal(mode: Match.GameMode): number
-	return if mode.UsesTeams then Config.Modes.TeamDeathmatch.KillGoal else Config.Modes.FreeForAll.KillGoal
+-- Config.TeamModes is keyed by the mode id, so a new mode needs a goal there
+-- and nothing here.
+local function killGoal(mode: Match.TeamMode): number
+	return Config.TeamModes[mode.Id].KillGoal
 end
 
 local function scoreFor(player: Player): Score
@@ -210,7 +206,7 @@ function ScoreService.recordKill(killer: Player, victim: Player)
 	writeRow(killer, { Kills = killerScore.Kills, LastKillAt = killerScore.LastKillAt })
 	writeRow(victim, { Deaths = victimScore.Deaths })
 
-	local mode = RoundService.getMode()
+	local mode = RoundService.getTeamMode()
 	local goal = killGoal(mode)
 	local reachedGoal = false
 
@@ -307,11 +303,16 @@ function ScoreService.resetRound()
 	-- and an unannotated loop variable comes out of Match.TEAM_ORDER widened to
 	-- plain `string`, which the union key then rejects. Match.TEAM_ORDER is also
 	-- the one list that already knows which teams exist.
+	-- Every team, not just this round's: a Green score left over from a
+	-- four-team round would otherwise still be on the wire in the next one.
+	-- SetValues merges, so only a key that is written is cleared.
+	local zeroed: { [string]: number } = {}
 	for _, team: Match.TeamId in Match.TEAM_ORDER do
 		teamScores[team] = 0
+		zeroed[team] = 0
 	end
 
-	RoundService.writeScores({ Red = 0, Blue = 0 })
+	RoundService.writeScores(zeroed)
 	for _, player in Players:GetPlayers() do
 		-- A fresh table per player: SetValues is handed this reference, and one
 		-- shared table reused across writes is a shape nobody expects to alias.

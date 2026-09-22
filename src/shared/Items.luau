@@ -9,15 +9,19 @@
 	A plain module (ARCHITECTURE.md Recipe 3). Shared because the toolbar draws
 	slots from it while the server decides what a throw actually does.
 
-	Timings and ranges are NOT here -- they are in Config.Flash / Config.Smoke,
-	so every tunable number in the game stays in one file. This module is the
-	catalog: what exists, what it is called, what colour its slot is.
+	Timings and ranges are NOT here -- they are in Config.Flash / Config.Smoke /
+	Config.Frag / Config.Shock / Config.Impulse, so every tunable number in the
+	game stays in one file. This
+	module is the catalog: what exists, what it is called, what colour its slot
+	is.
 
-	Adding a third item is this table plus a branch in GrenadeService.detonate.
-	Nothing in the toolbar, the pickup system or the HUD needs to change.
+	Adding an item is this table plus a row in GrenadeService's GRENADES table.
+	Nothing in the toolbar or the HUD needs to change. Pickups are authored per
+	map in Studio (a node's ItemId attribute), so a new item only shows up on
+	the maps whose nodes name it.
 ]]
 
-export type ItemId = "Flashbang" | "SmokeGrenade"
+export type ItemId = "Flashbang" | "SmokeGrenade" | "FragGrenade" | "ShockGrenade" | "ImpulseGrenade"
 
 export type ItemDefinition = {
 	Id: ItemId,
@@ -43,6 +47,28 @@ Items.LIST = {
 		DisplayName = "Smoke Grenade",
 		ShortName = "SMK",
 		Color = Color3.fromRGB(150, 160, 175),
+	},
+	{
+		Id = "FragGrenade",
+		DisplayName = "Frag Grenade",
+		ShortName = "FRG",
+		-- Olive, the colour anyone reads as a frag. Not the stun effect's
+		-- yellow: the slot and the effect are different things to look for.
+		Color = Color3.fromRGB(122, 150, 80),
+	},
+	{
+		Id = "ShockGrenade",
+		DisplayName = "Shock Grenade",
+		ShortName = "SHK",
+		-- Electric blue, the colour of the arcs it leaves on the players it hits.
+		Color = Color3.fromRGB(90, 190, 255),
+	},
+	{
+		Id = "ImpulseGrenade",
+		DisplayName = "Impulse Grenade",
+		ShortName = "IMP",
+		-- Magenta: the colour of its shockwave, and nothing else in the game.
+		Color = Color3.fromRGB(235, 90, 220),
 	},
 } :: { ItemDefinition }
 

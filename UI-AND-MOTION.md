@@ -175,3 +175,32 @@ exactly one writer and never two disagreeing about the current value.
 
 - **Names address screens, so they must be unique.** Two `Shop`s earns a warn and
   the newer wins.
+
+- **A grid of fixed-shape cards** (Shop catalog, Inventory, the case preview) is a
+  `UIGridLayout` with a `UIAspectRatioConstraint` parented to the *layout*, and a
+  `CellSize` whose width is a scale and whose height is a **large offset**
+  (`UDim2.new(0.235, 0, 0, 4000)`). The constraint shrinks each cell to fit the
+  aspect inside `CellSize`, so a height of 0 collapses every card to nothing.
+  Give the grid's ScrollingFrame a `UIPadding` of a few pixels on every side: a
+  ScrollingFrame clips, so a card's `UIStroke` (drawn outside the card) and the
+  hover scale are cut off at the edges without it.
+
+- **Anything cloned into a list must be sized in offset, not scale.** A template's
+  scale is relative to wherever it is authored; its clone lands in a different,
+  usually smaller, list and comes out tiny. The same goes for a multi-row
+  `UIGridLayout` cell height and a `UIListLayout` padding. An offset-to-scale
+  conversion pass over a screen breaks exactly these and nothing else, which is
+  why it looks fine in Studio and wrong at runtime. It happened once to
+  `Screens.Admin` (2026-09-22).
+
+- **An overlay inside a panel replaces the panel's content** (`UI/PanelOverlay.luau`),
+  it does not sit on top of it. Drawn on top, the panel's padding left its edges
+  showing and the buttons underneath still took clicks. `PanelOverlay.show(overlay)`
+  hides the visible siblings and returns the function that restores them. The Shop's
+  case preview and the Inventory's case reveal use it.
+
+- **A screen used during a round needs `Modal = true` on one visible button.**
+  First person locks the mouse to the centre, and switching the camera to Classic
+  does not free it while the camera is still zoomed in. A visible `Modal` button is
+  the engine's own way to free the cursor, only while that screen is enabled.
+  `Screens.Admin` has it on its CloseButton.

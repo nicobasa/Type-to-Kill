@@ -23,6 +23,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+local Config = require(ReplicatedStorage.Shared.Config)
 local Log = require(ReplicatedStorage.Shared.Log)
 local Match = require(ReplicatedStorage.Shared.Match)
 local Replica = require(ReplicatedStorage.ReplicaClient)
@@ -124,7 +125,7 @@ end
 
 --[[
 	No whitelist check for the phase, unlike the state above, because Match
-	publishes isState and isModeId and deliberately publishes no isPhase. A
+	publishes isState and isTeamModeId and deliberately publishes no isPhase. A
 	list of the four phases written out here would be a second copy of an enum
 	the server owns -- the exact drift Match.luau's header warns about -- so a
 	string is taken at its word and only the absence of one is corrected.
@@ -293,23 +294,42 @@ function MatchController.getState(): Match.MatchState
 	return normalizeState(roundReplica.Data.State)
 end
 
-function MatchController.getModeId(): Match.GameModeId
-	if roundReplica == nil or not Match.isModeId(roundReplica.Data.ModeId) then
-		return Match.DEFAULT_MODE
+function MatchController.getTeamModeId(): Match.TeamModeId
+	if roundReplica == nil or not Match.isTeamModeId(roundReplica.Data.TeamModeId) then
+		return Match.DEFAULT_TEAM_MODE
 	end
-	return roundReplica.Data.ModeId :: Match.GameModeId
+	return roundReplica.Data.TeamModeId :: Match.TeamModeId
+end
+
+-- getTeamModeId only ever returns a key Match.TEAM_MODES holds, so the index
+-- cannot come back nil.
+function MatchController.getTeamMode(): Match.TeamMode
+	return Match.TEAM_MODES[MatchController.getTeamModeId()]
 end
 
 --[[
-	The TDM/FFA fork, for everything that has one: team select, the score HUD,
-	how a teammate's code is drawn. Fork on this, never on the mode id -- a
-	third mode then needs no edit at any call site (Match.luau).
-
-	getModeId only ever returns a key Match.MODES holds, so the index below
-	cannot come back nil.
+	The teams/FFA fork, for everything that has one: team select, the score
+	HUD, how a teammate's code is drawn. Fork on this, never on the mode id --
+	a new mode then needs no edit at any call site (Match.luau).
 ]]
 function MatchController.usesTeams(): boolean
-	return Match.MODES[MatchController.getModeId()].UsesTeams
+	return MatchController.getTeamMode().UsesTeams
+end
+
+function MatchController.getGameModeId(): Match.GameModeId
+	if roundReplica == nil or not Match.isGameModeId(roundReplica.Data.GameModeId) then
+		return Match.DEFAULT_GAME_MODE
+	end
+	return roundReplica.Data.GameModeId :: Match.GameModeId
+end
+
+--[[
+	How many digits this round's codes have: 4 in Standard, 8 in Extreme. The
+	client's one source for it, and it changes between rounds, so read it when
+	you need it rather than caching it (Config.Code says the same).
+]]
+function MatchController.getCodeDigits(): number
+	return Config.GameModes[MatchController.getGameModeId()].CodeDigits
 end
 
 --[[

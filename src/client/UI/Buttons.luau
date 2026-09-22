@@ -178,6 +178,23 @@ local function bind(instance: Instance)
 			set(false, false)
 		end)
 	)
+
+	--[[
+		A button that closes its own screen (MENU -> Shop) never gets its
+		MouseLeave: the cursor did not move, the button just stopped being
+		drawn. Without this it comes back hovered the next time the screen
+		opens. So any open or close of its screen resets it -- if the cursor
+		really is still over it, the next movement hovers it again.
+	]]
+	local screenGui = button:FindFirstAncestorOfClass("ScreenGui")
+	if screenGui ~= nil then
+		table.insert(
+			state.connections,
+			screenGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+				set(false, false)
+			end)
+		)
+	end
 end
 
 local function unbind(instance: Instance)

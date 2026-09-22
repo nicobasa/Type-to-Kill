@@ -429,17 +429,33 @@ local function applyHeadline(current: View, standings: { Standing })
 	if MatchController.usesTeams() then
 		local round = MatchController.getRound()
 		local scores = if round ~= nil then round.Scores else nil
-		local red = readScore(scores, "Red")
-		local blue = readScore(scores, "Blue")
+		local teams = MatchController.getTeamMode().Teams
 
-		if red > blue then
-			outcome = teamWinsText("Red")
-		elseif blue > red then
-			outcome = teamWinsText("Blue")
-		else
-			outcome = "DRAW"
+		--[[
+			The top score across every side the round played with, and who
+			holds it. Two or more at the top is a DRAW -- the same rule
+			RewardService pays out on, so the headline and the reward line
+			underneath it never disagree.
+		]]
+		local best = -1
+		local leaders: { Match.TeamId } = {}
+		local parts: { string } = {}
+		for _, team: Match.TeamId in teams do
+			local value = readScore(scores, team)
+			table.insert(parts, `{value}`)
+			if value > best then
+				best = value
+				table.clear(leaders)
+				table.insert(leaders, team)
+			elseif value == best then
+				table.insert(leaders, team)
+			end
 		end
-		score = `{red} - {blue}`
+
+		outcome = if #leaders == 1 then teamWinsText(leaders[1]) else "DRAW"
+		-- "12 - 9" for two teams, "12 - 9 - 4 - 7" for four, in the mode's own
+		-- team order so it reads the same way as the HUD boxes did.
+		score = table.concat(parts, " - ")
 	else
 		local leader = standings[1]
 		if leader == nil then

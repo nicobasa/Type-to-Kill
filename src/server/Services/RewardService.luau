@@ -69,18 +69,18 @@ local MAX_WIRE_AMOUNT = 4294967295
 local TEAM_AWARDS: { Win: Award, Draw: Award, Loss: Award } = {
 	Win = {
 		resultText = "VICTORY",
-		cash = Config.Rewards.TeamDeathmatch.WinCash,
-		experience = Config.Rewards.TeamDeathmatch.WinExperience,
+		cash = Config.Rewards.Teams.WinCash,
+		experience = Config.Rewards.Teams.WinExperience,
 	},
 	Draw = {
 		resultText = "DRAW",
-		cash = Config.Rewards.TeamDeathmatch.DrawCash,
-		experience = Config.Rewards.TeamDeathmatch.DrawExperience,
+		cash = Config.Rewards.Teams.DrawCash,
+		experience = Config.Rewards.Teams.DrawExperience,
 	},
 	Loss = {
 		resultText = "DEFEAT",
-		cash = Config.Rewards.TeamDeathmatch.LossCash,
-		experience = Config.Rewards.TeamDeathmatch.LossExperience,
+		cash = Config.Rewards.Teams.LossCash,
+		experience = Config.Rewards.Teams.LossExperience,
 	},
 }
 
@@ -224,11 +224,37 @@ local function collectParticipants(): { Player }
 	return participants
 end
 
-local function awardTeamMatch(participants: { Player })
+--[[
+	How a team finished: Win for sole first place, Draw for a tie for first,
+	Loss for anything else. Measured against every team the mode plays with,
+	not against "the other team" -- with four sides there is no one other team,
+	and comparing against a single one would let three teams all "win".
+]]
+local function teamOutcome(team: Match.TeamId, teams: { Match.TeamId }): Award
+	local own = ScoreService.getTeamScore(team)
+	local best = own
+	local tiedAtBest = 0
+	for _, other: Match.TeamId in teams do
+		local score = ScoreService.getTeamScore(other)
+		if score > best then
+			best = score
+		end
+	end
+	if own < best then
+		return TEAM_AWARDS.Loss
+	end
+	for _, other: Match.TeamId in teams do
+		if ScoreService.getTeamScore(other) == best then
+			tiedAtBest += 1
+		end
+	end
+	return if tiedAtBest > 1 then TEAM_AWARDS.Draw else TEAM_AWARDS.Win
+end
+
+local function awardTeamMatch(participants: { Player }, teams: { Match.TeamId })
 	for _, player in participants do
 		-- Annotated, not inferred: refining an inferred TeamId against nil
-		-- widens it to plain `string`, which ScoreService.getTeamScore and
-		-- Match.opposingTeam below both refuse.
+		-- widens it to plain `string`, which teamOutcome below refuses.
 		local team: Match.TeamId? = TeamService.getTeam(player)
 		if team == nil then
 			--[[
@@ -246,17 +272,7 @@ local function awardTeamMatch(participants: { Player })
 			continue
 		end
 
-		local own = ScoreService.getTeamScore(team)
-		local other = ScoreService.getTeamScore(Match.opposingTeam(team))
-
-		local award = TEAM_AWARDS.Loss
-		if own > other then
-			award = TEAM_AWARDS.Win
-		elseif own == other then
-			award = TEAM_AWARDS.Draw
-		end
-
-		payout(player, award)
+		payout(player, teamOutcome(team, teams))
 	end
 end
 
@@ -282,9 +298,9 @@ local function awardMatch()
 		return
 	end
 
-	local mode = RoundService.getMode()
+	local mode = RoundService.getTeamMode()
 	if mode.UsesTeams then
-		awardTeamMatch(participants)
+		awardTeamMatch(participants, mode.Teams)
 	else
 		awardFreeForAll(participants)
 	end

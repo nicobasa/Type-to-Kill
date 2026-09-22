@@ -166,7 +166,7 @@ Attributes are great for scalars and Studio visibility, but every attribute on a
 ## Gotchas worth knowing up front
 
 - **`ReplicaShared` must be at `ReplicatedStorage.ReplicaShared`.** Hardcoded in the library (`ReplicaServer.luau:88`). Don't move it.
-- **`ProfileStore.Mock` in Studio** — without it, Studio testing with API services on writes to **live player keys**, and a bad migration tested in Studio corrupts real data. `DataService.Init` handles this.
+- **Studio uses its own store (`PlayerData_v1_Studio`)** — without it, Studio testing with API services on writes to **live player keys**, and a bad migration tested in Studio corrupts real data. It is a real store, not `ProfileStore.Mock`: the Mock is memory-only, so a Studio test lost everything on Stop, which looks exactly like a save bug. The module body of `DataService` picks the store.
 - **`Replica.Token(name)` errors if called twice with the same string.** Keep tokens at module scope, never inside a function.
 
 ---

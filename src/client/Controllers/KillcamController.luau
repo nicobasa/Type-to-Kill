@@ -36,6 +36,7 @@ local Log = require(ReplicatedStorage.Shared.Log)
 local Match = require(ReplicatedStorage.Shared.Match)
 local MatchController = require(script.Parent.MatchController)
 local Net = require(ReplicatedStorage.Shared.Net)
+local TitleStyle = require(script.Parent.Parent.UI.TitleStyle)
 local UIController = require(script.Parent.UIController)
 
 local log = Log.new("KillcamController")
@@ -98,6 +99,8 @@ type Card = {
 	level: TextLabel?,
 	kills: TextLabel?,
 	respawn: TextLabel?,
+	-- The killer's equipped title (TitleStyle), under their name.
+	title: TextLabel?,
 }
 
 type KilledPacket = {
@@ -105,6 +108,7 @@ type KilledPacket = {
 	killerName: string,
 	killerLevel: number,
 	killerKills: number,
+	killerTitle: string,
 	respawnAt: number,
 }
 
@@ -224,6 +228,7 @@ local function resolveCard(screens: Instance): Card?
 		level = findLabel(root, "Card.LevelLabel"),
 		kills = findLabel(root, "Card.KillsLabel"),
 		respawn = findLabel(root, "RespawnLabel"),
+		title = findLabel(root, "Card.TitleLabel"),
 	}
 end
 
@@ -510,6 +515,13 @@ local function begin(data: KilledPacket)
 	setText(resolved.level, `LEVEL {data.killerLevel}`)
 	setText(resolved.kills, if data.killerKills == 1 then "1 KILL" else `{data.killerKills} KILLS`)
 	setText(resolved.respawn, formatRespawn(current.shownSeconds))
+
+	-- An empty line when the killer has no title equipped; TitleStyle clears
+	-- the previous killer's animation either way.
+	local titleLabel = resolved.title
+	if titleLabel ~= nil then
+		TitleStyle.apply(titleLabel, data.killerTitle)
+	end
 
 	local avatar = resolved.avatar
 	if avatar ~= nil then

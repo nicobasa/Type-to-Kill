@@ -42,6 +42,7 @@ local DataController = require(script.Parent.DataController)
 local Log = require(ReplicatedStorage.Shared.Log)
 local Motion = require(script.Parent.Parent.UI.Motion)
 local Progression = require(ReplicatedStorage.Shared.Progression)
+local TitleStyle = require(script.Parent.Parent.UI.TitleStyle)
 
 local log = Log.new("PlayerCardController")
 
@@ -80,6 +81,8 @@ type Card = {
 	barFill: GuiObject?,
 	barFillBase: UDim2,
 	cash: TextLabel?,
+	-- The equipped cosmetic title, drawn by TitleStyle. Optional like the rest.
+	title: TextLabel?,
 }
 
 local PlayerCardController = {}
@@ -377,6 +380,25 @@ local function paintProgress()
 	renderedLevel = level
 end
 
+--[[
+	The equipped title, or an empty line for none. TitleStyle owns the
+	animation and drops it by itself when the label is destroyed, so the
+	Destroying handler has nothing to stop for it.
+]]
+local function paintTitle()
+	local ui = card
+	if ui == nil then
+		return
+	end
+	local label = ui.title
+	if label == nil then
+		return
+	end
+	local data = DataController.getData()
+	local equipped = if data ~= nil and type(data.EquippedTitle) == "string" then data.EquippedTitle else ""
+	TitleStyle.apply(label, equipped)
+end
+
 local function paintCash()
 	local ui = card
 	if ui == nil then
@@ -425,6 +447,7 @@ local function bind(root: Instance): Card?
 		barFill = barFill,
 		barFillBase = if barFill ~= nil then barFill.Size else UDim2.new(),
 		cash = if cashPill ~= nil then findLabel(cashPill, "CashLabel") else nil,
+		title = findLabel(holder, "TitleLabel"),
 	}
 end
 
@@ -487,6 +510,7 @@ function attach()
 	paintIdentity(bound)
 	paintProgress()
 	paintCash()
+	paintTitle()
 end
 
 --[[
@@ -543,6 +567,7 @@ function PlayerCardController.Start()
 
 	DataController.observe({ "Experience" }, paintProgress)
 	DataController.observe({ "Cash" }, paintCash)
+	DataController.observe({ "EquippedTitle" }, paintTitle)
 
 	attach()
 end

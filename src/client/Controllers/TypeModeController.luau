@@ -1,6 +1,7 @@
 --!strict
 --[[
-	The typing path: open the panel, type a four-digit code, send it.
+	The typing path: open the panel, type a code (four digits in Standard,
+	eight in Extreme), send it.
 
 	This is the one input in the game that has to feel instant, so two
 	properties come before everything else here:
@@ -35,7 +36,9 @@ local UserInputService = game:GetService("UserInputService")
 local Binds = require(script.Parent.Parent.UI.Binds)
 local Config = require(ReplicatedStorage.Shared.Config)
 local Device = require(script.Parent.Parent.UI.Device)
+local EffectsController = require(script.Parent.EffectsController)
 local Log = require(ReplicatedStorage.Shared.Log)
+local Match = require(ReplicatedStorage.Shared.Match)
 local MatchController = require(script.Parent.MatchController)
 local Motion = require(script.Parent.Parent.UI.Motion)
 local Net = require(ReplicatedStorage.Shared.Net)
@@ -77,6 +80,25 @@ local SUBMIT_VALUE = "OK"
 -- The rejection flash. Loud for a frame, gone in a quarter second -- it has to
 -- read as "not that one" without being something the player waits out.
 local REJECT_COLOR = Color3.fromRGB(226, 72, 72)
+
+-- What PromptLabel says while a frag stun has taken typing away, in the stun
+-- effect's yellow (GrenadeService, EffectsController) so it reads as the same
+-- event the screen edge is already announcing.
+local STUNNED_PROMPT = "STUNNED — CAN'T TYPE"
+local STUNNED_COLOR = Color3.fromRGB(255, 221, 64)
+
+--[[
+	The shortest and longest code any ruleset uses (Config.GameModes): the
+	panel binds boxes for the longest, and only the shortest's are required.
+	See bindPanel.
+]]
+local MIN_CODE_DIGITS = math.huge
+local MAX_CODE_DIGITS = 0
+for _, id in Match.GAME_MODE_ORDER do
+	local digits = Config.GameModes[id].CodeDigits
+	MIN_CODE_DIGITS = math.min(MIN_CODE_DIGITS, digits)
+	MAX_CODE_DIGITS = math.max(MAX_CODE_DIGITS, digits)
+end
 
 --[[
 	Every key that produces a digit, including the numeric keypad. This is a
@@ -129,6 +151,13 @@ type Panel = {
 	slots: { Slot },
 	-- Where gamepad selection lands on open. nil if the pad authored no digits.
 	firstKey: GuiButton?,
+	-- The "ENTER CODE" title, rewritten while stunned. Optional: a panel
+	-- without one still locks during a stun, it just cannot say so there.
+	promptLabel: TextLabel?,
+	-- Its authored look, read once at bind so the stun has something true to
+	-- restore to.
+	promptText: string,
+	promptColor: Color3,
 }
 
 local TypeModeController = {}
@@ -136,7 +165,7 @@ local TypeModeController = {}
 local panel: Panel? = nil
 local panelOpen = false
 
--- The digits so far, "" through "0047".
+-- The digits so far, "" through "0047" (or eight digits in Extreme).
 local typed = ""
 
 -- os.clock() floor on the next submit. See submit().
@@ -185,12 +214,22 @@ local function keyboardIsClaimed(): boolean
 	return UserInputService:GetFocusedTextBox() ~= nil
 end
 
+-- This round's code length. Read every time: it is the ruleset, and it
+-- changes between rounds (MatchController.getCodeDigits).
+local function codeDigits(): number
+	return MatchController.getCodeDigits()
+end
+
 local function render()
 	local current = panel
 	if current == nil then
 		return
 	end
+	local length = codeDigits()
 	for index, slot in current.slots do
+		-- As many boxes as the round's code has. The Digits layout closes the
+		-- gap, so four boxes sit centred in a Standard round.
+		slot.frame.Visible = index <= length
 		-- string.sub past the end returns "", so an untyped box empties itself
 		-- with no branch. The authored box is its own placeholder.
 		slot.label.Text = string.sub(typed, index, index)
@@ -292,8 +331,37 @@ local function submit()
 	-- they sent, and codeResult clears them on either outcome.
 end
 
+--[[
+	The panel's stunned look: the prompt says why nothing is typing, in the
+	stun's yellow. Called on every stun change, on open, and after a rebind,
+	so a panel opened mid-stun or re-cloned mid-stun is already saying it.
+]]
+local function applyStunState()
+	local current = panel
+	if current == nil then
+		return
+	end
+	local prompt = current.promptLabel
+	if prompt == nil then
+		return
+	end
+	if EffectsController.isStunned() then
+		prompt.Text = STUNNED_PROMPT
+		prompt.TextColor3 = STUNNED_COLOR
+	else
+		prompt.Text = current.promptText
+		prompt.TextColor3 = current.promptColor
+	end
+end
+
 local function appendDigit(digit: string)
-	if #typed >= Config.Code.Digits then
+	-- Stunned: the panel stays open and the digits already typed stay up, but
+	-- nothing new goes in. The server refuses a stunned submit regardless
+	-- (KillService); this is so the player is never invited to make one.
+	if EffectsController.isStunned() then
+		return
+	end
+	if #typed >= codeDigits() then
 		-- The boxes are full and that code is already on its way. A shake here
 		-- would read as a rejection the server has not sent yet.
 		return
@@ -302,15 +370,15 @@ local function appendDigit(digit: string)
 	render()
 
 	-- The last digit sends the code. A code is only ever exactly
-	-- Config.Code.Digits long, so no Enter press is needed to mark the end
+	-- codeDigits() long, so no Enter press is needed to mark the end
 	-- of one.
-	if #typed == Config.Code.Digits then
+	if #typed == codeDigits() then
 		submit()
 	end
 end
 
 local function deleteDigit()
-	if #typed == 0 then
+	if #typed == 0 or EffectsController.isStunned() then
 		return
 	end
 	setTyped(string.sub(typed, 1, #typed - 1))
@@ -326,11 +394,11 @@ end
 	digits still gets told this is not a code, rather than nothing happening.
 ]]
 local function confirm()
-	if panel == nil then
+	if panel == nil or EffectsController.isStunned() then
 		return
 	end
 
-	if #typed < Config.Code.Digits then
+	if #typed < codeDigits() then
 		--[[
 			A short code can only come back BadCode, and the trip would spend
 			the rate-limit window the next real submit needs. Same red as a
@@ -371,6 +439,9 @@ end
 
 local function onKeyPressed(value: string)
 	if value == CLEAR_VALUE then
+		if EffectsController.isStunned() then
+			return
+		end
 		setTyped("")
 		restoreSlots()
 	elseif value == SUBMIT_VALUE then
@@ -496,12 +567,12 @@ local function hintText(): string
 	-- names the key that opened the panel, since that is the only one that
 	-- closes it.
 	if device == "Touch" then
-		return `TAP {Config.Code.Digits} DIGITS`
+		return `TAP {codeDigits()} DIGITS`
 	end
 	if device == "Gamepad" then
 		return `{Binds.label(Binds.BACKSPACE)} DELETE / {Binds.label(Binds.TYPE_MODE)} CLOSE`
 	end
-	return `TYPE {Config.Code.Digits} DIGITS / {Binds.label(Binds.TYPE_MODE)} CLOSE`
+	return `TYPE {codeDigits()} DIGITS / {Binds.label(Binds.TYPE_MODE)} CLOSE`
 end
 
 local function applyDevice()
@@ -542,6 +613,13 @@ local function onScreenOpened()
 	-- player did not choose to send now.
 	setTyped("")
 	restoreSlots()
+	applyStunState()
+	-- The hint names the digit count, which is the round's; it may have
+	-- changed since the panel was bound.
+	local current = panel
+	if current ~= nil then
+		current.hintLabel.Text = hintText()
+	end
 	bindInput()
 
 	--[[
@@ -678,23 +756,31 @@ local function bindPanel(screen: Instance): boolean
 	end
 
 	--[[
-		Config.Code.Digits drives the loop, not the number of children: the
-		panel authors four boxes because Config says four. If the two ever
-		disagree, the missing box is named here rather than the player typing
-		digits that land nowhere visible.
+		Config.GameModes drives the loop, not the number of children: the
+		panel authors one box per digit of the LONGEST code (eight, Extreme),
+		and render() shows only as many as the round's code has.
+
+		Only the boxes the SHORTEST code needs are required. A missing one of
+		those is fatal to the bind, named here, because no round could be
+		typed. A missing box past that only costs the longer ruleset, so it is
+		warned about and the bind carries on with the boxes it has -- the
+		alternative is one mis-authored eighth box killing typing in every
+		Standard round too, for the rest of the session.
 	]]
 	local slots: { Slot } = {}
-	for index = 1, Config.Code.Digits do
+	for index = 1, MAX_CODE_DIGITS do
+		local required = index <= MIN_CODE_DIGITS
 		local frame = findElement(digits, { `Digit{index}` })
-		if frame == nil or not frame:IsA("GuiObject") then
-			stale(`Root.Panel.Digits.Digit{index}`, "GuiObject")
-			return false
-		end
-
-		local label = findElement(frame, { "TextLabel" })
-		if label == nil or not label:IsA("TextLabel") then
-			stale(`Root.Panel.Digits.Digit{index}.TextLabel`, "TextLabel")
-			return false
+		local label = if frame ~= nil then findElement(frame, { "TextLabel" }) else nil
+		if frame == nil or not frame:IsA("GuiObject") or label == nil or not label:IsA("TextLabel") then
+			if required then
+				stale(`Root.Panel.Digits.Digit{index}(.TextLabel)`, "GuiObject with a TextLabel")
+				return false
+			end
+			log.warn(
+				`Screens.{SCREEN_NAME}.Root.Panel.Digits.Digit{index} is missing -- {index}-digit codes cannot be typed`
+			)
+			break
 		end
 
 		local stroke = frame:FindFirstChildOfClass("UIStroke")
@@ -726,6 +812,12 @@ local function bindPanel(screen: Instance): boolean
 		return false
 	end
 
+	-- Optional, unlike everything above: only the stun message is lost
+	-- without it, so a missing prompt does not take typing down with it.
+	local promptFound = root:FindFirstChild("Panel")
+	promptFound = if promptFound ~= nil then promptFound:FindFirstChild("PromptLabel") else nil
+	local promptLabel = if promptFound ~= nil and promptFound:IsA("TextLabel") then promptFound else nil
+
 	panel = {
 		root = root,
 		keypad = keypad,
@@ -733,7 +825,12 @@ local function bindPanel(screen: Instance): boolean
 		hintLabel = hintLabel,
 		slots = slots,
 		firstKey = bindKeypad(keypad),
+		promptLabel = promptLabel,
+		promptText = if promptLabel ~= nil then promptLabel.Text else "",
+		promptColor = if promptLabel ~= nil then promptLabel.TextColor3 else Color3.new(1, 1, 1),
 	}
+	-- A re-clone mid-stun arrives with the authored text; say it again.
+	applyStunState()
 
 	-- Connected per bind rather than per session: this is a new instance after
 	-- every re-clone, and the connection dies with the one it was made on.
@@ -905,6 +1002,20 @@ function TypeModeController.Start()
 	]]
 	UIController.onOpen(SCREEN_NAME, onScreenOpened)
 	UIController.onClose(SCREEN_NAME, onScreenClosed)
+
+	-- Open or closed, the panel follows the stun: a player who opens it
+	-- mid-stun, or keeps it open while stunned, reads why nothing types.
+	EffectsController.onStunChanged(function()
+		applyStunState()
+	end)
+
+	-- A new ruleset is a different number of boxes and a different hint. The
+	-- panel cannot be open across the change (it lands at MapLoading and the
+	-- panel only opens while Playing), so this only has to redraw.
+	MatchController.observe({ "GameModeId" }, function()
+		render()
+		applyDevice()
+	end)
 
 	MatchController.onPhaseChanged(function(phase)
 		if phase ~= "Playing" and UIController.isOpen(SCREEN_NAME) then

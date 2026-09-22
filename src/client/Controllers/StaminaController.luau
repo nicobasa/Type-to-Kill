@@ -39,6 +39,7 @@ local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 
 local Binds = require(script.Parent.Parent.UI.Binds)
 local Config = require(ReplicatedStorage.Shared.Config)
@@ -167,6 +168,82 @@ local missingWarned = false
 
 local warningTransparency = 1
 local pulseClock = 0
+
+--[[
+	THE BOOST (Adrenaline). While a player sprints under a ruleset with
+	InfiniteStamina, the fill is covered by a vivid rainbow flowing to the
+	LEFT, a glint sweeps across it the other way now and then, and the bar
+	kicks up in size as the sprint starts -- the "sugar rush" bar of
+	candy-boost games.
+
+	THE LOOK is a continuous rainbow -- an even sweep of hue, one smooth blend
+	with no bands -- tilted to the same diagonal as the glint. The one
+	adjustment to a plain sweep: a wide range of hues all read as green, so a
+	plain sweep makes green look longer than the rest. The sweep therefore
+	runs faster through the green hues (BOOST_GREEN_SHARE), spending a little
+	less of the bar there. It is still a smooth sweep, just unevenly paced.
+
+	HOW IT STAYS SMOOTH. The rainbow is drawn ONCE, into a strip of identical
+	one-rainbow segments much larger than the bar, and only the strip's
+	Position is animated. Rebuilding a ColorSequence every frame instead makes
+	the colours hop from keypoint to keypoint, which reads as a stutter. The
+	segments are identical, so sliding one period and snapping back is
+	seamless.
+
+	HOW IT IS DIAGONAL. The whole strip is rotated by BOOST_ANGLE, the same
+	angle as the glint, so the colours lean with it. Sliding the rotated
+	strip horizontally still repeats every rainbow: a horizontal move of one
+	horizontal period shifts the pattern along its own axis by exactly one
+	segment.
+
+	Everything sits in a CanvasGroup with the fill's own corner, so the strip
+	and the glint are clipped to the bar's rounded shape.
+
+	PHOTOSENSITIVITY. The colour at any spot changes continuously, never in
+	jumps, and the glint sweeps past any one spot about once every 2.2
+	seconds -- well under 3 per second (GAMEPLAY.md, the photosensitivity
+	rule).
+
+	Created here, on the authored fill, for the reason TitleStyle gives: it is
+	not layout, it is a state of the bar.
+]]
+local BOOST_LAYER = "BoostLayer"
+local BOOST_SCALE = "BoostScale"
+local BOOST_KICK = 1.18
+-- How many full rainbows fit across the bar, measured horizontally.
+local BOOST_RAINBOWS_ACROSS = 1.5
+-- How far the rainbow flows per second, in rainbows.
+local BOOST_FLOW_SPEED = 0.8
+local BOOST_SATURATION = 0.85
+-- ColorSequence allows at most 20 keypoints; one segment is one rainbow.
+local BOOST_RAINBOW_KEYPOINTS = 20
+--[[
+	The hues that read as green (about 68..160 degrees) and the share of the
+	rainbow they get. An even sweep would give them their hue width, 92/360
+	(about 26%); this gives them 18%, which shortens green without making
+	the rainbow uneven anywhere else.
+]]
+local BOOST_GREEN_FROM = 68 / 360
+local BOOST_GREEN_TO = 160 / 360
+local BOOST_GREEN_SHARE = 0.18
+-- The lean of the colours and of the glint, in degrees.
+local BOOST_ANGLE = 25
+-- The rotated strip's width, in bar widths (see createBoostLayer).
+local BOOST_STRIP_WIDTH = 3
+--[[
+	The glint crosses left to right at a steady BOOST_GLINT_SPEED bar widths
+	per second -- faster than the colours flow the other way
+	(BOOST_FLOW_SPEED / BOOST_RAINBOWS_ACROSS, about 0.53) -- then rests for
+	BOOST_GLINT_REST before the next pass. Its width is in bar widths.
+]]
+local BOOST_GLINT_SPEED = 0.9
+local BOOST_GLINT_REST = 0.35
+local BOOST_GLINT_WIDTH = 0.26
+-- Where a pass starts and ends: fully off the bar on both sides.
+local BOOST_GLINT_FROM = -0.35
+local BOOST_GLINT_TO = 1.35
+local boosting = false
+local boostClock = 0
 -- Last value actually written to each property. Sentinels no transparency or
 -- scale can hold, so the first draw after a bind always writes.
 local lastFillScale = -1
@@ -196,12 +273,235 @@ local function waitForDescendant(root: Instance, path: { string }): Instance?
 end
 
 --[[
+	The hue at `u` (0..1 along one rainbow): an even sweep everywhere except
+	through the greens, which are crossed faster so they take
+	BOOST_GREEN_SHARE of the rainbow instead of their full hue width.
+]]
+local function rainbowHue(u: number): number
+	local greenWidth = BOOST_GREEN_TO - BOOST_GREEN_FROM
+	local otherShare = 1 - BOOST_GREEN_SHARE
+	-- The part of the rainbow before green, in u.
+	local beforeGreen = BOOST_GREEN_FROM / (1 - greenWidth) * otherShare
+	local afterStart = beforeGreen + BOOST_GREEN_SHARE
+	if u < beforeGreen then
+		return u / beforeGreen * BOOST_GREEN_FROM
+	elseif u < afterStart then
+		return BOOST_GREEN_FROM + (u - beforeGreen) / BOOST_GREEN_SHARE * greenWidth
+	end
+	return BOOST_GREEN_TO + (u - afterStart) / (1 - afterStart) * (1 - BOOST_GREEN_TO)
+end
+
+-- One rainbow, ending on the colour it starts with so segments join
+-- seamlessly. Built once: the flow moves frames, never rebuilds colours.
+local RAINBOW: ColorSequence
+do
+	local keypoints: { ColorSequenceKeypoint } = {}
+	for index = 0, BOOST_RAINBOW_KEYPOINTS - 1 do
+		local u = index / (BOOST_RAINBOW_KEYPOINTS - 1)
+		local hue = rainbowHue(u) % 1
+		table.insert(keypoints, ColorSequenceKeypoint.new(u, Color3.fromHSV(hue, BOOST_SATURATION, 1)))
+	end
+	RAINBOW = ColorSequence.new(keypoints)
+end
+
+--[[
+	A glint: a narrow white frame, `width` bar widths wide and much taller than
+	the bar, leaning at BOOST_ANGLE like the colours, faded across its width
+	by `glint` -- (position, transparency) pairs over 0..1. A rotated FRAME,
+	not a rotated UIGradient: a UIGradient's rotation on a bar this wide
+	squeezes the band to a sliver, while a frame's width is exactly what it
+	is set to.
+]]
+local function createGlint(parent: Instance, name: string, width: number, glint: { { number } }, zIndex: number)
+	local frame = Instance.new("Frame")
+	frame.Name = name
+	frame.BackgroundColor3 = Color3.new(1, 1, 1)
+	frame.BorderSizePixel = 0
+	frame.AnchorPoint = Vector2.new(0.5, 0.5)
+	frame.Position = UDim2.fromScale(-1, 0.5)
+	frame.Size = UDim2.fromScale(width, 4)
+	frame.Rotation = BOOST_ANGLE
+	frame.ZIndex = zIndex
+	local keypoints: { NumberSequenceKeypoint } = {}
+	for _, point in glint do
+		table.insert(keypoints, NumberSequenceKeypoint.new(point[1], point[2]))
+	end
+	local gradient = Instance.new("UIGradient")
+	gradient.Transparency = NumberSequence.new(keypoints)
+	gradient.Parent = frame
+	frame.Parent = parent
+end
+
+--[[
+	The boost layer: a CanvasGroup over the fill, with the fill's own corner so
+	everything inside is clipped to the bar's shape. Inside it, the strip of
+	rainbow segments, then the one glint on top.
+]]
+local function createBoostLayer(fill: GuiObject)
+	local layer = Instance.new("CanvasGroup")
+	layer.Name = BOOST_LAYER
+	layer.BackgroundTransparency = 1
+	layer.BorderSizePixel = 0
+	layer.Size = UDim2.fromScale(1, 1)
+	layer.ZIndex = fill.ZIndex + 1
+	local corner = fill:FindFirstChildOfClass("UICorner")
+	if corner ~= nil then
+		corner:Clone().Parent = layer
+	end
+
+	--[[
+		The strip: BOOST_STRIP_WIDTH bar widths wide and two bar WIDTHS tall
+		(the bar's own aspect, read once), centred on the bar and rotated by
+		BOOST_ANGLE, so however it leans and slides it still covers the whole
+		bar. Everything is in scale units: offsets would be scaled a second
+		time by the HUD's UIScale.
+
+		Along the strip's own axis a rainbow is `segment` long, chosen so that
+		measured HORIZONTALLY across the bar there are BOOST_RAINBOWS_ACROSS.
+	]]
+	local absolute = fill.AbsoluteSize
+	local aspect = if absolute.Y > 0 then absolute.X / absolute.Y else 10
+	local cosine = math.cos(math.rad(BOOST_ANGLE))
+	local segment = cosine / (BOOST_RAINBOWS_ACROSS * BOOST_STRIP_WIDTH)
+	local strip = Instance.new("Frame")
+	strip.Name = "Strip"
+	strip.BackgroundTransparency = 1
+	strip.BorderSizePixel = 0
+	strip.AnchorPoint = Vector2.new(0.5, 0.5)
+	strip.Position = UDim2.fromScale(0.5, 0.5)
+	-- Two bar widths tall: one was measured to leave the top-right corner
+	-- uncovered at the far end of a slide, where the tilt lifts the strip.
+	strip.Size = UDim2.fromScale(BOOST_STRIP_WIDTH, aspect * 2)
+	strip.Rotation = BOOST_ANGLE
+	strip.ZIndex = layer.ZIndex
+	for index = 0, math.ceil(1 / segment) do
+		local piece = Instance.new("Frame")
+		piece.Name = `Rainbow{index}`
+		piece.BackgroundColor3 = Color3.new(1, 1, 1)
+		piece.BorderSizePixel = 0
+		-- A pixel wider than its slot, so no gap can open between segments
+		-- at fractional pixel positions.
+		piece.Position = UDim2.fromScale(index * segment, 0)
+		piece.Size = UDim2.new(segment, 1, 1, 0)
+		piece.ZIndex = layer.ZIndex
+		local gradient = Instance.new("UIGradient")
+		gradient.Color = RAINBOW
+		gradient.Parent = piece
+		piece.Parent = strip
+	end
+	strip.Parent = layer
+
+	-- The glint: a wide white band, see-through even at its core so the
+	-- colours still show under it, fading out at both edges.
+	createGlint(layer, "Glint", BOOST_GLINT_WIDTH, {
+		{ 0, 1 },
+		{ 0.15, 0.85 },
+		{ 0.3, 0.58 },
+		{ 0.4, 0.42 },
+		{ 0.5, 0.38 },
+		{ 0.6, 0.42 },
+		{ 0.7, 0.58 },
+		{ 0.85, 0.85 },
+		{ 1, 1 },
+	}, layer.ZIndex + 1)
+
+	layer.Parent = fill
+end
+
+-- The glint's centre at `clock`, in bar widths: a steady pass left to right,
+-- then parked off the bar for the rest.
+local function glintPosition(clock: number): number
+	local travel = BOOST_GLINT_TO - BOOST_GLINT_FROM
+	local sweep = travel / BOOST_GLINT_SPEED
+	local t = clock % (sweep + BOOST_GLINT_REST)
+	if t >= sweep then
+		return BOOST_GLINT_FROM
+	end
+	return BOOST_GLINT_FROM + t * BOOST_GLINT_SPEED
+end
+
+-- Starts or ends the boost look on the current fill.
+local function setBoosting(fill: GuiObject, on: boolean)
+	boosting = on
+	local existing = fill:FindFirstChild(BOOST_LAYER)
+	if on then
+		-- The layer covers the fill entirely, so the fill's own colour and
+		-- gradient are left exactly as authored underneath it.
+		if existing == nil then
+			createBoostLayer(fill)
+		end
+		-- The kick: the whole bar grows and settles back as the sprint starts.
+		local panel = fill.Parent
+		if panel ~= nil and panel:IsA("GuiObject") then
+			local found = panel:FindFirstChild(BOOST_SCALE)
+			local scale: UIScale
+			if found ~= nil and found:IsA("UIScale") then
+				scale = found
+			else
+				scale = Instance.new("UIScale")
+				scale.Name = BOOST_SCALE
+				scale.Parent = panel
+			end
+			scale.Scale = BOOST_KICK
+			TweenService:Create(scale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+				Scale = 1,
+			}):Play()
+		end
+	else
+		if existing ~= nil then
+			existing:Destroy()
+		end
+	end
+end
+
+-- Boosting means sprinting, and moving, under a ruleset with endless stamina.
+local function shouldBoost(): boolean
+	if not Config.GameModes[MatchController.getGameModeId()].InfiniteStamina or not predictedActive then
+		return false
+	end
+	local humanoid = boundHumanoid
+	return humanoid ~= nil and humanoid.MoveDirection.Magnitude > MOVE_EPSILON
+end
+
+local function drawBoost(fill: GuiObject, deltaTime: number)
+	local want = shouldBoost()
+	if want ~= boosting then
+		setBoosting(fill, want)
+	end
+	if not boosting then
+		return
+	end
+	boostClock += deltaTime
+	local layer = fill:FindFirstChild(BOOST_LAYER)
+	if layer == nil then
+		return
+	end
+
+	-- The strip slides LEFT by one horizontal rainbow per rainbow flowed,
+	-- then wraps: that move shifts the tilted pattern by exactly one
+	-- segment along its own axis, so the wrap is invisible.
+	local strip = layer:FindFirstChild("Strip")
+	if strip ~= nil and strip:IsA("GuiObject") then
+		local flowed = (boostClock * BOOST_FLOW_SPEED) % 1
+		strip.Position = UDim2.fromScale(0.5 - flowed / BOOST_RAINBOWS_ACROSS, 0.5)
+	end
+
+	-- The glint crosses the other way.
+	local x = glintPosition(boostClock)
+	local glint = layer:FindFirstChild("Glint")
+	if glint ~= nil and glint:IsA("GuiObject") then
+		glint.Position = UDim2.fromScale(x, 0.5)
+	end
+end
+
+--[[
 	Draws the current prediction. Kept separate from the simulation because the
 	simulation must never stop and this may -- see step().
 ]]
 local function draw(deltaTime: number)
 	local fill = barFill
 	if fill ~= nil then
+		drawBoost(fill, deltaTime)
 		local scale = stamina / MAX_STAMINA
 		if math.abs(scale - lastFillScale) > FILL_EPSILON then
 			lastFillScale = scale
@@ -366,7 +666,11 @@ local function step(deltaTime: number)
 			requestActive(true)
 		end
 
-		if predictedActive and humanoid.MoveDirection.Magnitude > MOVE_EPSILON then
+		-- Endless stamina (Adrenaline) never drains, exactly as SprintService
+		-- does not: the prediction must match the server or the bar would dip
+		-- and snap back.
+		local drains = not Config.GameModes[MatchController.getGameModeId()].InfiniteStamina
+		if drains and predictedActive and humanoid.MoveDirection.Magnitude > MOVE_EPSILON then
 			stamina = math.max(stamina - DRAIN_RATE * deltaTime, 0)
 			regenAt = now + REGEN_DELAY
 
@@ -507,6 +811,8 @@ local function clearHud()
 
 	hudGui = nil
 	barFill = nil
+	-- The boost lived on the old fill; the next fill starts plain.
+	boosting = false
 	barWarning = nil
 	sprintButton = nil
 	-- No button on screen means no latch: see applyDevice.

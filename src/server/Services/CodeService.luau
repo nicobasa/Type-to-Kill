@@ -1,7 +1,7 @@
 --!strict
 --[[
-	The kill code: the four digits a player types to kill someone, and the
-	table that says whose they are.
+	The kill code: the digits a player types to kill someone (four in Standard,
+	eight in Extreme), and the table that says whose they are.
 
 	A CODE YOU CAN SEE CANNOT BE HIDDEN FROM YOU -- stated plainly, because
 	every decision below depends on it. The four digits have to be legible on
@@ -63,11 +63,20 @@ local log = Log.new("CodeService")
 ]]
 local RoundService: typeof(require(script.Parent.RoundService)) = nil :: any
 
-local DIGITS = Config.Code.Digits
-local CODE_SPACE = 10 ^ DIGITS
--- Built from DIGITS rather than written as "%04d", so lowering Config.Code.Digits
--- cannot leave a five-character code in a four-digit game.
-local CODE_FORMAT = `%0{DIGITS}d`
+--[[
+	The code length is the round's ruleset (Standard 4, Extreme 8), so nothing
+	here caches it at module load: every draw asks RoundService, which was
+	settled at MapLoading, before the first code of the round can be drawn.
+	Codes never outlive a round (releaseAll below), so no pool ever mixes two
+	lengths.
+
+	The format string is built from the length rather than written as "%04d",
+	so a length change cannot leave a five-character code in a four-digit game.
+]]
+local function codeShape(): (number, string)
+	local digits = RoundService.getCodeDigits()
+	return 10 ^ digits, `%0{digits}d`
+end
 
 local DRAW_ATTEMPTS = 16
 
@@ -101,10 +110,11 @@ local random = Random.new()
 	reading one code tells a player roughly where the next ones are. The random
 	draw has neither property and, at any occupancy this game can reach,
 	finishes on the first attempt almost always: Roblox caps a server at 700
-	players against 10^4 codes, so one collision is under 7% likely and
-	DRAW_ATTEMPTS consecutive collisions about 1e-19. The bounded sweep drawCode
-	falls back on only matters if Config.Code.Digits is lowered until the code
-	space and the player cap are comparable, which Init() warns about at boot.
+	players against 10^4 codes (the smallest space, Standard's), so one
+	collision is under 7% likely and DRAW_ATTEMPTS consecutive collisions about
+	1e-19. The bounded sweep drawCode falls back on only matters if a ruleset's
+	CodeDigits is lowered until the code space and the player cap are
+	comparable, which Init() warns about at boot.
 ]]
 local codeOwners: { [string]: Player? } = {}
 local playerCodes: { [Player]: string } = {}
@@ -149,20 +159,23 @@ local CodeService = {}
 	with a failure), so that outcome would be silent and invisible. The sweep
 	starts from a random offset and wraps, so even the degenerate case never
 	hands out codes in ascending order; it only runs at an occupancy this game
-	cannot reach with a sane Config.Code.Digits, and it is bounded by the code
-	space, which is why it is a last resort rather than the implementation.
+	cannot reach with a sane code length, and it is bounded by the code space,
+	which is why it is a last resort rather than the implementation. (At eight
+	digits that bound is 10^8, but it cannot be reached: the space is never
+	near full.)
 ]]
 local function drawCode(excluded: string?): string?
+	local space, format = codeShape()
 	for _ = 1, DRAW_ATTEMPTS do
-		local code = string.format(CODE_FORMAT, random:NextInteger(0, CODE_SPACE - 1))
+		local code = string.format(format, random:NextInteger(0, space - 1))
 		if codeOwners[code] == nil and code ~= excluded then
 			return code
 		end
 	end
 
-	local offset = random:NextInteger(0, CODE_SPACE - 1)
-	for i = 0, CODE_SPACE - 1 do
-		local code = string.format(CODE_FORMAT, (offset + i) % CODE_SPACE)
+	local offset = random:NextInteger(0, space - 1)
+	for i = 0, space - 1 do
+		local code = string.format(format, (offset + i) % space)
 		if codeOwners[code] == nil and code ~= excluded then
 			return code
 		end
@@ -315,6 +328,17 @@ local function attachHeadband(character: Model)
 		number copied into this file is one that silently stops matching the
 		model the first time they nudge it.
 	]]
+	--[[
+		The plate grows along its width (the Sign's Z, the long side of its Top
+		face) for rulesets with longer codes (Config.GameModes SignWidthScale).
+		Size changes about the part's centre, so the plate stays centred on the
+		forehead and the offset below is unaffected.
+	]]
+	if sign ~= nil then
+		local widthScale = Config.GameModes[RoundService.getGameModeId()].SignWidthScale
+		sign.Size = Vector3.new(sign.Size.X, sign.Size.Y, sign.Size.Z * widthScale)
+	end
+
 	local signOffset: CFrame? = nil
 	if sign ~= nil and handle ~= nil then
 		signOffset = handle.CFrame:ToObjectSpace(sign.CFrame)
@@ -440,7 +464,9 @@ function CodeService.assign(player: Player): string?
 	if code == nil then
 		-- Every code in the space is taken, not a run of bad luck: the sweep in
 		-- drawCode has already looked at all of them.
-		log.error(`all {CODE_SPACE} codes are in use -- {player.Name} spawns unkillable. Raise Config.Code.Digits.`)
+		log.error(
+			`all {(codeShape())} codes are in use -- {player.Name} spawns unkillable. Raise the ruleset's CodeDigits.`
+		)
 		return nil
 	end
 
@@ -485,7 +511,7 @@ function CodeService.reroll(player: Player): string?
 	-- in ten thousand, a no-op.
 	local code = drawCode(old)
 	if code == nil then
-		log.error(`all {CODE_SPACE} codes are in use -- {player.Name} keeps {old}. Raise Config.Code.Digits.`)
+		log.error(`all {(codeShape())} codes are in use -- {player.Name} keeps {old}. Raise the ruleset's CodeDigits.`)
 		return nil
 	end
 
@@ -612,8 +638,13 @@ function CodeService.Init()
 		boot because that is the only moment anyone is looking at the log for
 		configuration problems.
 	]]
-	if CODE_SPACE < Players.MaxPlayers * 4 then
-		log.warn(`{CODE_SPACE} codes for up to {Players.MaxPlayers} players -- raise Config.Code.Digits`)
+	-- Against the SMALLEST ruleset: an eight-digit Extreme would hide a real
+	-- shortage in four-digit Standard rounds.
+	for _, id in Match.GAME_MODE_ORDER do
+		local space = 10 ^ Config.GameModes[id].CodeDigits
+		if space < Players.MaxPlayers * 4 then
+			log.warn(`{space} codes in {id} for up to {Players.MaxPlayers} players -- raise its CodeDigits`)
+		end
 	end
 
 	-- GetPlayers() covers anyone who joined while the server was still booting;
@@ -908,7 +939,7 @@ local function sweepVisibility()
 end
 
 function CodeService.Start()
-	log.info(`ready ({DIGITS}-digit codes, visible within {Config.Code.VisibleRange} studs)`)
+	log.info(`ready (code length set per round by the ruleset, visible within {Config.Code.VisibleRange} studs)`)
 
 	--[[
 		In Start, not Init: it loops and yields, which Init may not do

@@ -51,7 +51,19 @@ local TEMPLATE = {
 	Level = 1,
 	Experience = 0,
 	-- Nested tables are fine -- this is the whole reason Replica exists.
+	-- Counted stacks only (InventoryService); cases live here as "TitleCase".
 	Inventory = {} :: { [string]: number },
+	--[[
+		Owned titles, as a set: { [titleId] = true }. Its own field, NOT under
+		Inventory -- Inventory is { [id]: count } and InventoryService would
+		read a nested table as a count of 0, or overwrite it with a number.
+		Seeded here because Replica's Set throws on a missing parent table.
+		Written only by CosmeticsService.
+	]]
+	Titles = {} :: { [string]: boolean },
+	-- The title shown on the player's card, or "" for none. Always one the
+	-- player owns (CosmeticsService checks before writing).
+	EquippedTitle = "",
 	Settings = {
 		MusicEnabled = true,
 		--[[
@@ -92,6 +104,8 @@ local MIGRATIONS: { (data: any) -> () } = {
 }
 
 local PROFILE_STORE_NAME = "PlayerData_v1"
+-- Studio's own store: real and persistent, but never the live players' keys.
+local STUDIO_STORE_SUFFIX = "_Studio"
 
 local DataService = {
 	-- Loads before anything that reads player data.
@@ -103,24 +117,27 @@ local DataService = {
 local PLAYER_DATA_TOKEN = Replica.Token("PlayerData")
 
 --[[
-	Mock in Studio. Without this, Studio testing with API services enabled writes
-	to LIVE player keys -- and a bad migration tested in Studio corrupts real
-	players' data.
+	A separate store in Studio. Studio testing with API services enabled must
+	never write to LIVE player keys -- a bad migration tested in Studio would
+	corrupt real players' data. So Studio gets its own store name.
 
-	This lives in the module body, not Init(), deliberately. `store.Mock` is a
-	plain field on the store table and the Mock table has no `.Mock` of its own,
-	so `store = store.Mock` run twice yields nil. Module bodies run exactly once
-	(require caches), so doing it here is idempotent by construction; doing it in
-	Init() is only correct as long as nothing ever calls Init() twice.
+	It is a REAL store, not ProfileStore's Mock. The Mock keeps data in memory
+	only, so everything earned in a Studio test vanished when Play stopped --
+	which looks exactly like a data-loss bug and hides real ones. With a
+	separate real store, Studio sessions persist like the live game does and
+	still cannot touch it. With API services off, ProfileStore falls back to
+	its in-memory mode on its own (and says so in the output).
 ]]
-local liveStore = ProfileStore.New(PROFILE_STORE_NAME, TEMPLATE)
--- Both branches expose the same persistence methods. Typing the result as the
--- mock interface also accepts the live store, whose extra `.Mock` field is not
--- needed below.
-local store: typeof(liveStore.Mock) = if RunService:IsStudio() then liveStore.Mock else liveStore
+local store = ProfileStore.New(
+	if RunService:IsStudio() then PROFILE_STORE_NAME .. STUDIO_STORE_SUFFIX else PROFILE_STORE_NAME,
+	TEMPLATE
+)
 
 local profiles: { [Player]: any } = {}
 local replicas: { [Player]: any } = {}
+
+-- Applies a queued profile message (see DataService.setMessageHandler).
+local messageHandler: ((player: Player, message: any) -> ())? = nil
 
 local function runMigrations(data: any)
 	local from = data.Version or 0
@@ -205,6 +222,37 @@ local function onPlayerAdded(player: Player)
 		end)
 	end
 
+	--[[
+		Admin edits queued for this profile while the player was offline or in
+		another server (DataService.sendMessage). Registered LAST, after the
+		replica exists: ProfileStore runs the handler immediately for every
+		message already waiting, and the handler writes through the replica so
+		the client sees the change like any other write.
+
+		processed() is called for every message the handler has looked at,
+		applied or refused, so a malformed message cannot sit in the queue
+		forever. ProfileStore removes it in the same save that stores the data
+		change, so "applied" and "consumed" cannot come apart.
+	]]
+	profile:MessageHandler(function(message: any, processed: () -> ())
+		local handler = messageHandler
+		if handler == nil then
+			-- Nobody to apply it yet; leave it queued rather than lose it.
+			return
+		end
+		if replicas[player] ~= replica or not replica:IsActive() then
+			return
+		end
+		-- Widened return, so the checker sees pcall's error value (the same
+		-- move RoundService.Start makes for xpcall).
+		local run: (Player, any) -> ...any = handler
+		local ok, err = pcall(run, player, message)
+		if not ok then
+			log.warn(`profile message for {player.Name} failed: {err}`)
+		end
+		processed()
+	end)
+
 	log.info(`loaded profile for {player.Name}`)
 end
 
@@ -270,6 +318,70 @@ end
 
 function DataService.getReplica(player: Player): any?
 	return replicas[player]
+end
+
+--========================================================================
+-- PLAYERS WHO ARE NOT IN THIS SERVER (the admin panel)
+--========================================================================
+
+--[[
+	WHY THERE IS NO "WRITE SOMEONE ELSE'S PROFILE" HERE
+
+	ProfileStore's view-profile SetAsync overwrites the whole profile AND
+	clears the session lock. For a player online in another server that is
+	two failures at once: everything they earned since that server's last
+	save is lost, and that server kicks them at its next save when it finds it
+	no longer owns the profile. So an edit to a player who is not in THIS
+	server is never written directly. It is queued with MessageAsync:
+
+	  - online in another server: that server is told over MessagingService to
+	    save, which delivers the message to its MessageHandler within seconds;
+	  - offline everywhere: it waits in the profile and applies on next join;
+	  - in this server: MessageAsync saves the local profile, which runs the
+	    handler above immediately (callers use set() instead, which is simpler).
+
+	The message is applied by whoever registered setMessageHandler
+	(AdminService), with the same validation as a live edit.
+]]
+
+-- Registers the one function that applies queued profile messages.
+function DataService.setMessageHandler(handler: (player: Player, message: any) -> ())
+	messageHandler = handler
+end
+
+export type Peek = {
+	-- The stored data, migrated to the current version for display. A copy the
+	-- caller may read freely; writing to it changes nothing.
+	data: any,
+	-- Where the player's live session is, if one holds the lock right now.
+	session: { PlaceId: number, JobId: string }?,
+}
+
+--[[
+	Reads a player's saved profile without starting a session. YIELDS (a
+	DataStore read, retried by ProfileStore). Nil if the player has never
+	played -- a UserId with no profile is not somebody to edit.
+]]
+function DataService.peek(userId: number): Peek?
+	local profile = store:GetAsync(tostring(userId))
+	if profile == nil then
+		return nil
+	end
+	local data = profile.Data
+	runMigrations(data)
+	return { data = data, session = profile.Session }
+end
+
+--[[
+	Queues `message` on a player's saved profile (see the section header).
+	YIELDS. False if ProfileStore gave up (the server is closing). The caller
+	must have confirmed the profile exists (peek): MessageAsync on a key that
+	was never used creates one.
+
+	The message must be JSON-safe: strings, numbers, booleans, plain tables.
+]]
+function DataService.sendMessage(userId: number, message: { [string]: any }): boolean
+	return store:MessageAsync(tostring(userId), message)
 end
 
 return DataService

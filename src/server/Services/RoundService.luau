@@ -39,6 +39,7 @@ local ServerStorage = game:GetService("ServerStorage")
 
 local Config = require(ReplicatedStorage.Shared.Config)
 local Log = require(ReplicatedStorage.Shared.Log)
+local MapCatalog = require(ReplicatedStorage.Shared.MapCatalog)
 local MapService = require(script.Parent.MapService)
 local Match = require(ReplicatedStorage.Shared.Match)
 local Replica = require(ServerStorage.ReplicaServer)
@@ -75,17 +76,31 @@ export type StateListener = (state: Match.MatchState, previous: Match.MatchState
 
 type RoundData = {
 	State: Match.MatchState,
-	ModeId: Match.GameModeId,
+	GameModeId: Match.GameModeId,
+	TeamModeId: Match.TeamModeId,
 	MapId: string,
 	PhaseEndsAt: number,
-	Scores: { Red: number, Blue: number },
+	-- Keyed by TeamId, every team in Match.TEAM_ORDER. A string key because
+	-- the replica path is a string; ScoreService is the writer.
+	Scores: { [string]: number },
 	Vote: {
 		MapChoices: { string },
 		MapVotes: { [string]: number },
-		ModeVotes: { [string]: number },
+		GameModeVotes: { [string]: number },
+		TeamModeVotes: { [string]: number },
 	},
 	Players: { [string]: Match.RoundPlayer },
 }
+
+-- Zero for every team that exists, so the wire always carries all four keys
+-- and a four-team round never reads a nil where a score should be.
+local function zeroScores(): { [string]: number }
+	local scores: { [string]: number } = {}
+	for _, team in Match.TEAM_ORDER do
+		scores[team] = 0
+	end
+	return scores
+end
 
 -- One token per replica kind, at module scope: Replica.Token errors on a
 -- duplicate string (ReplicaServer.luau:260), and a module body runs exactly
@@ -102,11 +117,12 @@ local ROUND_TOKEN = Replica.Token(Match.REPLICA_TOKEN)
 ]]
 local roundData: RoundData = {
 	State = "Lobby",
-	ModeId = Match.DEFAULT_MODE,
+	GameModeId = Match.DEFAULT_GAME_MODE,
+	TeamModeId = Match.DEFAULT_TEAM_MODE,
 	MapId = "",
 	PhaseEndsAt = 0,
-	Scores = { Red = 0, Blue = 0 },
-	Vote = { MapChoices = {}, MapVotes = {}, ModeVotes = {} },
+	Scores = zeroScores(),
+	Vote = { MapChoices = {}, MapVotes = {}, GameModeVotes = {}, TeamModeVotes = {} },
 	Players = {},
 }
 
@@ -235,16 +251,29 @@ function RoundService.getState(): Match.MatchState
 	return roundData.State
 end
 
-function RoundService.getModeId(): Match.GameModeId
-	return roundData.ModeId
+function RoundService.getTeamModeId(): Match.TeamModeId
+	return roundData.TeamModeId
 end
 
 --[[
-	The mode definition. Fork on `UsesTeams`, never on the id: a third mode
-	then needs no edit at the call site (Match.luau).
+	The team mode definition. Fork on `UsesTeams` and read `Teams`, never
+	compare the id: a new mode then needs no edit at the call site (Match.luau).
 ]]
-function RoundService.getMode(): Match.GameMode
-	return Match.MODES[roundData.ModeId]
+function RoundService.getTeamMode(): Match.TeamMode
+	return Match.TEAM_MODES[roundData.TeamModeId]
+end
+
+function RoundService.getGameModeId(): Match.GameModeId
+	return roundData.GameModeId
+end
+
+--[[
+	How many digits this round's codes have. The one server-side source for
+	it: CodeService draws with it and KillService validates with it, and both
+	ask at the moment they need it because it changes between rounds.
+]]
+function RoundService.getCodeDigits(): number
+	return Config.GameModes[roundData.GameModeId].CodeDigits
 end
 
 -- "" while no map is loaded, which includes the whole of Lobby and Voting.
@@ -387,13 +416,89 @@ end
 	the client and would blank the match timer for the tick before the results
 	screen arrives.
 ]]
-function RoundService.endRound()
+function RoundService.endRound(reason: string?)
 	if roundData.State ~= "RoundActive" or endRequested then
 		return
 	end
 	endRequested = true
-	log.info("round ending early -- win condition reached")
+	log.info(`round ending early -- {reason or "win condition reached"}`)
 	writeDeadline(workspace:GetServerTimeNow())
+end
+
+--========================================================================
+-- ADMIN CONTROL (AdminService is the only caller)
+--========================================================================
+
+--[[
+	Every admin control below works through the two things the loop already
+	re-reads: the phase deadline (sleepUntilPhaseEnd polls it) and two flags
+	runCycle checks between phases. Nothing here moves the state machine
+	itself -- runCycle still makes every transition, so an admin cannot put
+	the match in a state Match's TRANSITIONS table does not allow.
+]]
+
+-- Set by restartRound, checked (and cleared) by runCycle after each phase.
+local restartRequested = false
+
+export type NextOverride = {
+	mapId: string?,
+	gameModeId: Match.GameModeId?,
+	teamModeId: Match.TeamModeId?,
+	-- Skip the vote entirely: the round goes straight from Lobby to loading.
+	skipVote: boolean,
+}
+
+-- What the next round is forced to, consumed (and cleared) at the vote.
+local nextOverride: NextOverride? = nil
+
+--[[
+	End the current phase now. In RoundActive that is endRound -- the round
+	goes to results and pays out, exactly as a win would. A phase with no
+	deadline (the empty-server wait) has nothing to skip.
+]]
+function RoundService.skipPhase(): boolean
+	if roundData.State == "RoundActive" then
+		RoundService.endRound("skipped by an admin")
+		return true
+	end
+	if roundData.PhaseEndsAt <= 0 then
+		return false
+	end
+	writeDeadline(workspace:GetServerTimeNow())
+	return true
+end
+
+--[[
+	Abandon the current round and start over at Lobby, WITHOUT results or
+	rewards: a restart is not a finish. Everyone goes back to the menu (the
+	Lobby sweep in ParticipantService), the map unloads, and a new vote opens
+	-- or, with a skip-vote override set, the forced map loads straight away.
+]]
+function RoundService.restartRound()
+	restartRequested = true
+	log.info("round restart requested by an admin")
+	writeDeadline(workspace:GetServerTimeNow())
+end
+
+function RoundService.setNextOverride(override: NextOverride)
+	nextOverride = override
+end
+
+function RoundService.clearNextOverride()
+	nextOverride = nil
+end
+
+function RoundService.getNextOverride(): NextOverride?
+	return nextOverride
+end
+
+-- True (once) if an admin asked for a restart since the cycle began.
+local function consumeRestart(): boolean
+	if restartRequested then
+		restartRequested = false
+		return true
+	end
+	return false
 end
 
 --[[
@@ -405,6 +510,10 @@ end
 	wedged.
 ]]
 local function runCycle()
+	-- A restart asked for during the previous cycle has now happened: this IS
+	-- the fresh cycle it wanted.
+	restartRequested = false
+
 	if not enter("Lobby", Config.Round.IntermissionDuration) then
 		--[[
 			The only abandon point that has not yielded yet, and Start() paces
@@ -457,33 +566,71 @@ local function runCycle()
 		sleepUntilPhaseEnd()
 	end
 
-	if not enter("Voting", Config.Round.VotingDuration) then
+	--[[
+		An admin override is taken here, once, and cleared: it forces the next
+		round, never every round after it. With skipVote the Voting state is
+		still passed through (Lobby -> MapLoading is not a legal move) but with
+		no deadline and no ballot, so it lasts one step.
+	]]
+	local override = nextOverride
+	nextOverride = nil
+	local skipVote = override ~= nil and override.skipVote
+
+	if not enter("Voting", if skipVote then nil else Config.Round.VotingDuration) then
 		return
 	end
-	VoteService.beginVote()
-	sleepUntilPhaseEnd()
-	VoteService.endVote()
 
-	local mapId, modeId = VoteService.getResult()
+	local mapId: string
+	local gameModeId: Match.GameModeId
+	local teamModeId: Match.TeamModeId
+	if skipVote then
+		mapId = MapCatalog.LIST[math.random(1, #MapCatalog.LIST)].Id
+		gameModeId = roundData.GameModeId
+		teamModeId = roundData.TeamModeId
+	else
+		VoteService.beginVote()
+		sleepUntilPhaseEnd()
+		VoteService.endVote()
+		if consumeRestart() then
+			return
+		end
+		mapId, gameModeId, teamModeId = VoteService.getResult()
+	end
+
+	if override ~= nil then
+		mapId = override.mapId or mapId
+		gameModeId = override.gameModeId or gameModeId
+		teamModeId = override.teamModeId or teamModeId
+		log.info(`next round forced by an admin: {mapId} / {gameModeId} / {teamModeId}`)
+	end
 
 	--[[
-		getMode() indexes Match.MODES with this on every UsesTeams fork in the
-		game, so a mode id that is not one would not fail here -- it would fail
-		eight services away, indexing nil, with nothing in the log pointing
-		back at the vote that produced it.
+		getTeamMode() and getCodeDigits() index their tables with these on every
+		fork in the game, so an id that is not one would not fail here -- it
+		would fail eight services away, indexing nil, with nothing in the log
+		pointing back at the vote that produced it.
 	]]
-	if not Match.isModeId(modeId) then
-		log.error(`vote returned unknown mode "{modeId}" -- falling back to {Match.DEFAULT_MODE}`)
-		modeId = Match.DEFAULT_MODE
+	if not Match.isGameModeId(gameModeId) then
+		log.error(`vote returned unknown game mode "{gameModeId}" -- falling back to {Match.DEFAULT_GAME_MODE}`)
+		gameModeId = Match.DEFAULT_GAME_MODE
+	end
+	if not Match.isTeamModeId(teamModeId) then
+		log.error(`vote returned unknown team mode "{teamModeId}" -- falling back to {Match.DEFAULT_TEAM_MODE}`)
+		teamModeId = Match.DEFAULT_TEAM_MODE
 	end
 
 	if not enter("MapLoading", Config.Round.MapLoadingMinDuration) then
 		return
 	end
 
-	-- Published before the map is up, not after: the client chooses its team
-	-- screen off ModeId and gets the whole load to build it.
-	roundReplica:Set({ "ModeId" }, modeId)
+	--[[
+		Both published before the map is up, and in ONE packet. The client
+		chooses its team screen off TeamModeId and sizes its keypad off
+		GameModeId, and gets the whole load to do it. No code for this round
+		can exist yet (the first is drawn at PLAY, in WaitingToPlay), so the
+		code length is settled before anything is drawn with it.
+	]]
+	roundReplica:SetValues({}, { GameModeId = gameModeId, TeamModeId = teamModeId })
 
 	if not MapService.load(mapId) then
 		--[[
@@ -501,11 +648,17 @@ local function runCycle()
 	-- it: a load that overran has already pushed the deadline into the past,
 	-- and this returns immediately.
 	sleepUntilPhaseEnd()
+	if consumeRestart() then
+		return
+	end
 
 	if not enter("WaitingToPlay", Config.Round.WaitingToPlayDuration) then
 		return
 	end
 	sleepUntilPhaseEnd()
+	if consumeRestart() then
+		return
+	end
 
 	if not enter("RoundActive", Config.Round.Duration) then
 		return
@@ -513,6 +666,10 @@ local function runCycle()
 	-- Ends on Config.Round.Duration or on endRound(), which is the same thing
 	-- from here: both are a deadline in roundData.PhaseEndsAt.
 	sleepUntilPhaseEnd()
+	-- A restart goes straight back to Lobby: no results screen, no payout.
+	if consumeRestart() then
+		return
+	end
 
 	if not enter("RoundResults", Config.Round.ResultsDuration) then
 		return

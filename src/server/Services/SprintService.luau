@@ -45,14 +45,35 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
+local StarterPlayer = game:GetService("StarterPlayer")
 
 local Config = require(ReplicatedStorage.Shared.Config)
 local Log = require(ReplicatedStorage.Shared.Log)
 local Net = require(ReplicatedStorage.Shared.Net)
 local ParticipantService = require(script.Parent.ParticipantService)
 local RateLimiter = require(ServerStorage.Modules.RateLimiter)
+local RoundService = require(script.Parent.RoundService)
 
 local log = Log.new("SprintService")
+
+--[[
+	The round's ruleset decides the pace (Config.GameModes): how fast walking
+	and sprinting are, and whether sprinting costs stamina at all. Read on
+	every use rather than cached, because it changes between rounds.
+]]
+local function ruleset(): typeof(Config.GameModes.Standard)
+	return Config.GameModes[RoundService.getGameModeId()]
+end
+
+-- A shocked player walks at Config.Shock.SlowSpeed and cannot sprint, whatever
+-- the ruleset's pace.
+local function speedFor(active: boolean, slowed: boolean): number
+	if slowed then
+		return Config.Shock.SlowSpeed
+	end
+	local rules = ruleset()
+	return if active then rules.SprintSpeed else rules.WalkSpeed
+end
 
 local MAX_STAMINA = Config.Stamina.Max
 local DRAIN_RATE = Config.Stamina.Max / Config.Stamina.DrainDuration
@@ -126,6 +147,12 @@ type SprintState = {
 	-- See resolveHumanoid: an identity change here IS the spawn signal, and the
 	-- reset that follows it is the whole of this service's respawn handling.
 	humanoid: Humanoid?,
+	-- os.clock() at which a frag stun ends, or 0 when not stunned. See
+	-- SprintService.stun.
+	stunnedUntil: number,
+	-- os.clock() at which a shock slow ends, or 0 when not slowed. See
+	-- SprintService.slow.
+	slowedUntil: number,
 }
 
 local states: { [Player]: SprintState } = {}
@@ -146,9 +173,41 @@ local function ensureState(player: Player): SprintState
 		regenAt = 0,
 		character = nil,
 		humanoid = nil,
+		stunnedUntil = 0,
+		slowedUntil = 0,
 	}
 	states[player] = state
 	return state
+end
+
+local function isSlowedNow(state: SprintState): boolean
+	return state.slowedUntil > os.clock()
+end
+
+--[[
+	Frozen or free, applied to the three things that move a character: its
+	pace, its jump, and turning to face the camera.
+
+	AutoRotate is part of the freeze on purpose. In first person the body turns
+	with the camera, and a stunned player who could still spin around would turn
+	their back and hide their code, which is the one thing a stun in this game
+	is for taking away. They can still look around; the body stays put.
+
+	Jump comes back as StarterPlayer's values, which are what every character
+	spawns with, so restoring never invents a jump the place did not author.
+]]
+local function applyFrozen(humanoid: Humanoid, frozen: boolean, active: boolean, slowed: boolean)
+	if frozen then
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+		humanoid.JumpHeight = 0
+		humanoid.AutoRotate = false
+		return
+	end
+	humanoid.WalkSpeed = speedFor(active, slowed)
+	humanoid.JumpPower = StarterPlayer.CharacterJumpPower
+	humanoid.JumpHeight = StarterPlayer.CharacterJumpHeight
+	humanoid.AutoRotate = true
 end
 
 --[[
@@ -209,7 +268,11 @@ local function resolveHumanoid(player: Player, state: SprintState): Humanoid?
 	state.stamina = MAX_STAMINA
 	state.regenAt = 0
 	state.active = false
-	humanoid.WalkSpeed = Config.Movement.WalkSpeed
+	-- A stun or a shock belongs to the body it hit. Dying mid-stun must not
+	-- carry the freeze (or the slow) into the next spawn.
+	state.stunnedUntil = 0
+	state.slowedUntil = 0
+	humanoid.WalkSpeed = speedFor(false, false)
 
 	return humanoid
 end
@@ -220,7 +283,7 @@ end
 ]]
 local function setActive(state: SprintState, humanoid: Humanoid, active: boolean)
 	state.active = active
-	humanoid.WalkSpeed = if active then Config.Movement.SprintSpeed else Config.Movement.WalkSpeed
+	humanoid.WalkSpeed = speedFor(active, isSlowedNow(state))
 end
 
 local function sendState(player: Player, state: SprintState)
@@ -269,7 +332,12 @@ local function onSetSprinting(data: { active: boolean }, player: Player)
 		requests. The client can re-ask while the key is held precisely because it
 		runs the identical curve and knows when the threshold is crossed.
 	]]
-	if not ParticipantService.isPlaying(player) or state.stamina < RESUME_STAMINA then
+	-- A stunned or shocked player is refused like one out of stamina, so the
+	-- client's predicted sprint is corrected back instead of drawing a sprint
+	-- that is not moving anybody.
+	local stunned = state.stunnedUntil > os.clock()
+	local slowed = isSlowedNow(state)
+	if stunned or slowed or not ParticipantService.isPlaying(player) or state.stamina < RESUME_STAMINA then
 		if refusalLimit.allow(player) then
 			sendState(player, state)
 		end
@@ -297,6 +365,9 @@ end
 ]]
 local function step(deltaTime: number)
 	local now = os.clock()
+	-- Endless stamina (Adrenaline): sprinting costs nothing, so the bar never
+	-- leaves full and never needs to regenerate.
+	local drains = not ruleset().InfiniteStamina
 
 	for player, state in states do
 		local humanoid = resolveHumanoid(player, state)
@@ -317,7 +388,24 @@ local function step(deltaTime: number)
 			continue
 		end
 
-		if state.active and humanoid.MoveDirection.Magnitude > MOVE_EPSILON then
+		-- The stun runs out here rather than on a task.delay: there is no
+		-- timer to cancel on death or respawn, and a new body has already
+		-- reset stunnedUntil in resolveHumanoid.
+		if state.stunnedUntil > 0 and now >= state.stunnedUntil then
+			state.stunnedUntil = 0
+			applyFrozen(humanoid, false, state.active, isSlowedNow(state))
+		end
+
+		-- The shock's slow runs out the same way. A frozen player stays frozen:
+		-- the stun's own expiry restores the pace, reading the slow then.
+		if state.slowedUntil > 0 and now >= state.slowedUntil then
+			state.slowedUntil = 0
+			if state.stunnedUntil == 0 then
+				humanoid.WalkSpeed = speedFor(state.active, false)
+			end
+		end
+
+		if drains and state.active and humanoid.MoveDirection.Magnitude > MOVE_EPSILON then
 			state.stamina = math.max(state.stamina - DRAIN_RATE * deltaTime, 0)
 			state.regenAt = now + REGEN_DELAY
 
@@ -338,6 +426,87 @@ local function step(deltaTime: number)
 			state.stamina = math.min(state.stamina + REGEN_RATE * deltaTime, MAX_STAMINA)
 		end
 	end
+end
+
+--[[
+	Freezes a living player in place for `duration` seconds: no walking, no
+	sprinting, no jumping, no turning the body. Returns false, having done
+	nothing, if they have no living body to freeze.
+
+	Lives here and not in whoever caused it because this service is the only
+	writer of WalkSpeed. A second writer would fight setActive: the next
+	sprint key press would hand a stunned player their speed back.
+
+	A second stun while frozen RESTARTS the timer at `duration`: a player with
+	one second left who is hit again has exactly `duration` left, not
+	`duration` plus the one. Stuns never stack.
+]]
+function SprintService.stun(player: Player, duration: number): boolean
+	local state = states[player]
+	if state == nil then
+		return false
+	end
+	local humanoid = resolveHumanoid(player, state)
+	if humanoid == nil or humanoid.Health <= 0 then
+		return false
+	end
+
+	state.stunnedUntil = os.clock() + duration
+
+	if state.active then
+		-- Server-initiated, like the force-cancel at zero stamina, so the
+		-- client is told: it is still holding the key and drawing a sprint.
+		state.active = false
+		sendState(player, state)
+	end
+	applyFrozen(humanoid, true, false, isSlowedNow(state))
+	return true
+end
+
+--[[ Whether a frag stun is holding this player right now. ]]
+function SprintService.isStunned(player: Player): boolean
+	local state = states[player]
+	return state ~= nil and state.stunnedUntil > os.clock()
+end
+
+--[[
+	Slows a living player to Config.Shock.SlowSpeed for `duration` seconds and
+	takes their sprint away for as long: a running sprint is cancelled, and a
+	new one is refused (onSetSprinting). Returns false, having done nothing, if
+	they have no living body.
+
+	Here for the reason stun() is: this service is the only writer of
+	WalkSpeed. A second shock RESTARTS the timer at `duration`; slows never
+	stack. A player frozen by a frag stays frozen -- the stun's expiry picks
+	the slow up if it is still running.
+]]
+function SprintService.slow(player: Player, duration: number): boolean
+	local state = states[player]
+	if state == nil then
+		return false
+	end
+	local humanoid = resolveHumanoid(player, state)
+	if humanoid == nil or humanoid.Health <= 0 then
+		return false
+	end
+
+	state.slowedUntil = os.clock() + duration
+
+	if state.active then
+		-- Server-initiated, so the client is told: it is still holding the key.
+		state.active = false
+		sendState(player, state)
+	end
+	if state.stunnedUntil == 0 then
+		humanoid.WalkSpeed = speedFor(false, true)
+	end
+	return true
+end
+
+--[[ Whether a shock slow is holding this player right now. ]]
+function SprintService.isSlowed(player: Player): boolean
+	local state = states[player]
+	return state ~= nil and isSlowedNow(state)
 end
 
 function SprintService.Init()

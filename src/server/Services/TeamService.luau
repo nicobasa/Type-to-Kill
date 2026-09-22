@@ -1,6 +1,6 @@
 --!strict
 --[[
-	Who is on Red, who is on Blue, and whether one more player may join them.
+	Who is on which team, and whether one more player may join one.
 
 	THE COUNT IS A TABLE IN THIS FILE, NOT Team:GetPlayers()
 
@@ -26,8 +26,10 @@
 	read-compute-write argument CashService.luau:3 makes about balances, with a
 	team slot as the contested resource instead of cash.
 
-	Nothing here knows about game modes. Free For All simply never calls
-	assign(), and every player's Team stays nil.
+	Nothing here reads the round's mode. The caller hands assign() the sides
+	the round plays with (Match.TeamMode.Teams), so a two-team round cannot put
+	anyone on Green however they ask. Free For All simply never calls assign(),
+	and every player's Team stays nil.
 ]]
 
 local Players = game:GetService("Players")
@@ -62,16 +64,16 @@ local teamInstances: { [Match.TeamId]: Team } = {}
 	decrement is a team that is permanently one slot short with nothing in the
 	logs to say so. Fewer than fifty players makes the loop free.
 ]]
-local function countTeams(): (number, number)
-	local red, blue = 0, 0
-	for _, team in assignments do
-		if team == "Red" then
-			red += 1
-		else
-			blue += 1
+local function countTeams(): { [Match.TeamId]: number }
+	local counts: { [Match.TeamId]: number } = { Red = 0, Blue = 0, Green = 0, Yellow = 0 }
+	-- Annotated: an inferred loop value widens TeamId to `string`, which is
+	-- not a key of the TeamId-keyed counts.
+	for _, team: Match.TeamId? in assignments do
+		if team ~= nil then
+			counts[team] += 1
 		end
 	end
-	return red, blue
+	return counts
 end
 
 --[[
@@ -118,49 +120,44 @@ function TeamService.getTeam(player: Player): Match.TeamId?
 	return assignments[player]
 end
 
-function TeamService.getCounts(): { Red: number, Blue: number }
-	local red, blue = countTeams()
-	-- A fresh table every call. Handing out an internal one lets a caller edit
-	-- the roster by editing what reads like a report.
-	return { Red = red, Blue = blue }
-end
-
 --[[
-	Would one more player on `team` keep the sides within
-	Config.Teams.MaxImbalance?
+	Would one more player on `team` keep the largest and smallest of `teams`
+	(the sides the round plays with) within Config.Teams.MaxImbalance?
 
 	Advisory: nothing may act on this without assign() asking again, for the
 	reason the header gives. It answers for a player who is currently on NO
 	team -- assign() handles a switch by taking the player off their old side
 	first, because counting someone on both sides at once refuses exactly the
 	swaps that would have evened the teams out.
+
+	TeamSelectController.wouldExceedImbalance mirrors this rule so the client
+	can grey out a button before it is refused. Change them together.
 ]]
-function TeamService.canJoin(team: Match.TeamId): boolean
-	if Match.TEAMS[team] == nil then
-		--[[
-			The count below is an if/else over the two ids, so an id that is
-			neither would fall down the Blue branch -- a string that came off a
-			client packet quietly getting an answer about a team it did not
-			name. assign() never reaches here with one, but canJoin is public
-			and the static type is only a promise the caller made.
-		]]
+function TeamService.canJoin(team: Match.TeamId, teams: { Match.TeamId }): boolean
+	-- A team the round does not play with is never joinable, whatever the
+	-- counts say. The static type is only a promise the caller made.
+	if table.find(teams, team) == nil then
 		return false
 	end
 
-	local red, blue = countTeams()
-	if team == "Red" then
-		red += 1
-	else
-		blue += 1
+	local counts = countTeams()
+	counts[team] += 1
+
+	local largest, smallest = -math.huge, math.huge
+	for _, side: Match.TeamId in teams do
+		local count = counts[side]
+		largest = math.max(largest, count)
+		smallest = math.min(smallest, count)
 	end
-	return math.abs(red - blue) <= Config.Teams.MaxImbalance
+	return largest - smallest <= Config.Teams.MaxImbalance
 end
 
 --[[
 	Put `player` on `team`. Returns false, having changed nothing, if the team
-	is full, the id is not a team, or the player has already left.
+	is full, the id is not one of `teams` (the sides the round plays with), or
+	the player has already left.
 ]]
-function TeamService.assign(player: Player, team: Match.TeamId): boolean
+function TeamService.assign(player: Player, team: Match.TeamId, teams: { Match.TeamId }): boolean
 	-- Annotated optional because it genuinely is: teamInstances is empty until
 	-- Init() fills it, and Luau types a table index as the value type rather
 	-- than value-or-nil. The check below is the point of the line.
@@ -201,7 +198,7 @@ function TeamService.assign(player: Player, team: Match.TeamId): boolean
 		nothing between the drop and the write yields.
 	]]
 	assignments[player] = nil
-	if not TeamService.canJoin(team) then
+	if not TeamService.canJoin(team, teams) then
 		assignments[player] = previous
 		return false
 	end
@@ -209,56 +206,6 @@ function TeamService.assign(player: Player, team: Match.TeamId): boolean
 	assignments[player] = team
 	player.Team = instance
 	return true
-end
-
---[[
-	Put `player` on whichever side needs them, and report which.
-
-	The side picked below is the smaller of the counts taken WITHOUT this
-	player, which is exactly the pair assign() measures after it drops them --
-	so the gap it checks is either one narrower than it was or 1, and with any
-	MaxImbalance >= 1 the assign cannot be refused for balance. It can still
-	refuse for a player who has already left, and then the id returned is the
-	side they WOULD have taken -- there is no honest team to report for someone
-	who is gone, and the signature has nowhere to say so.
-]]
-function TeamService.autoAssign(player: Player): Match.TeamId
-	-- Annotated for the same reason as in assign(): the comparisons below
-	-- widen an inferred TeamId to `string`, which then will not satisfy the
-	-- TeamId return type on the `team = previous` branch.
-	local previous: Match.TeamId? = assignments[player]
-
-	--[[
-		Everyone except this player. Their own row is not evidence about where
-		they belong, and counting it makes the lone Red player look like the
-		reason Red is ahead: autoAssign would move them to Blue, and the next
-		call would move them back.
-	]]
-	local red, blue = countTeams()
-	if previous == "Red" then
-		red -= 1
-	elseif previous == "Blue" then
-		blue -= 1
-	end
-
-	local team: Match.TeamId
-	if red < blue then
-		team = "Red"
-	elseif blue < red then
-		team = "Blue"
-	elseif previous ~= nil then
-		-- The rest of the server is even, so the side they are already on is
-		-- as good as the other one. Staying put beats a coin flip that re-teams
-		-- someone mid-match for nothing.
-		team = previous
-	else
-		-- Even sides and no team yet. Alternating would be predictable enough
-		-- to game by timing a join, so coin-flip it.
-		team = if math.random() < 0.5 then "Red" else "Blue"
-	end
-
-	TeamService.assign(player, team)
-	return team
 end
 
 --[[

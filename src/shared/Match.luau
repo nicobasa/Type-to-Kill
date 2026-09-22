@@ -41,17 +41,53 @@ export type MatchState = "Lobby" | "Voting" | "MapLoading" | "WaitingToPlay" | "
 ]]
 export type PlayerPhase = "Menu" | "TeamSelect" | "Playing" | "Killcam"
 
-export type GameModeId = "TeamDeathmatch" | "FreeForAll"
+--[[
+	A round is decided by TWO independent votes after the map, and they are two
+	different axes on purpose:
 
-export type TeamId = "Red" | "Blue"
+	  GameMode  -- the RULESET. Standard (four-digit codes), Extreme (eight), or
+	               Adrenaline (faster movement, endless stamina).
+	  TeamMode  -- who is on whose side. Two teams, four teams, or everyone
+	               for themselves.
+
+	The names follow what players call them. TeamMode used to be the only axis
+	and was called GameMode; if you are reading old history, "TeamDeathmatch"
+	is TwoTeams.
+]]
+export type GameModeId = "Standard" | "Extreme" | "Adrenaline"
+
+export type TeamModeId = "TwoTeams" | "FourTeams" | "FreeForAll"
+
+export type TeamId = "Red" | "Blue" | "Green" | "Yellow"
 
 export type GameMode = {
 	Id: GameModeId,
 	DisplayName: string,
-	-- Drives the whole TDM/FFA fork: team select, friendly-fire rejection,
+	-- One line under the name on the ballot.
+	Tagline: string,
+}
+
+export type TeamMode = {
+	Id: TeamModeId,
+	DisplayName: string,
+	Tagline: string,
+	-- Drives the whole teams/FFA fork: team select, friendly-fire rejection,
 	-- which score HUD is drawn, how placement is computed. Read this, never
 	-- compare Id to a literal at a call site.
 	UsesTeams: boolean,
+	-- The sides this mode plays with, in display order. Empty in Free For All.
+	-- A team NOT in this list does not exist for the round: the server refuses
+	-- to put anyone on it (ParticipantService.onRequestTeam), whatever a
+	-- client sends.
+	Teams: { TeamId },
+	--[[
+		Whether each team spawns at its own tagged spawn points (SpawnPointRed,
+		SpawnPointBlue) or everyone draws from the shared FFA pool. The maps
+		only author Red and Blue spawns, so four teams use the shared pool,
+		whose enemy-distance check already treats teammates as friends
+		(SpawnService.livingEnemyPositions).
+	]]
+	TeamSpawns: boolean,
 }
 
 export type TeamDefinition = {
@@ -60,14 +96,14 @@ export type TeamDefinition = {
 	-- For the Team instance, which takes a BrickColor and nothing else.
 	TeamBrickColor: BrickColor,
 	-- For UI. Never the sole carrier of meaning -- every team-coloured element
-	-- also spells RED or BLUE, because roughly one player in twelve cannot
-	-- separate these two hues reliably.
+	-- also spells the team's name, because roughly one player in twelve cannot
+	-- separate red from green reliably.
 	Color: Color3,
 }
 
 --[[
-	DEFAULT_MODE lives in the constructor, not below with the other constants,
-	and must stay there.
+	The two defaults live in the constructor, not below with the other
+	constants, and must stay there.
 
 	Luau widens a value ASSIGNED to a new property of this table:
 	`Match.DEFAULT_MODE = "TeamDeathmatch" :: GameModeId` reached every reader
@@ -76,12 +112,13 @@ export type TeamDefinition = {
 	constructor keeps its cast type, which was measured: moving it here and
 	deleting those three casts left the type gate clean.
 
-	This only matters for scalars. The array casts below (`:: { GameModeId }`)
+	This only matters for scalars. The array casts below (`:: { TeamModeId }`)
 	keep their element types as ordinary assignments. So a new constant whose
 	readers need a singleton union goes here, and anything else goes below.
 ]]
 local Match = {
-	DEFAULT_MODE = "TeamDeathmatch" :: GameModeId,
+	DEFAULT_GAME_MODE = "Standard" :: GameModeId,
+	DEFAULT_TEAM_MODE = "TwoTeams" :: TeamModeId,
 }
 
 --[[
@@ -111,22 +148,58 @@ local TRANSITIONS: { [string]: { MatchState } } = {
 ]]
 Match.STATES = { "Lobby", "Voting", "MapLoading", "WaitingToPlay", "RoundActive", "RoundResults" } :: { MatchState }
 
-Match.MODES = {
-	TeamDeathmatch = {
-		Id = "TeamDeathmatch",
-		DisplayName = "Team Deathmatch",
-		UsesTeams = true,
+-- The rulesets. What each one changes is in Config (Config.GameModes), with
+-- every other tunable number; this is the vocabulary.
+Match.GAME_MODES = {
+	Standard = {
+		Id = "Standard",
+		DisplayName = "Standard",
+		Tagline = "4-digit codes",
 	},
-	FreeForAll = {
-		Id = "FreeForAll",
-		DisplayName = "Free For All",
-		UsesTeams = false,
+	Extreme = {
+		Id = "Extreme",
+		DisplayName = "Extreme",
+		Tagline = "8-digit codes",
+	},
+	Adrenaline = {
+		Id = "Adrenaline",
+		DisplayName = "Adrenaline",
+		Tagline = "Faster, endless sprint boost",
 	},
 } :: { [string]: GameMode }
 
 -- Vote order and UI order. A dictionary has none, and "the mode buttons moved
 -- between rounds" is a real bug from iterating one.
-Match.MODE_ORDER = { "TeamDeathmatch", "FreeForAll" } :: { GameModeId }
+Match.GAME_MODE_ORDER = { "Standard", "Extreme", "Adrenaline" } :: { GameModeId }
+
+Match.TEAM_MODES = {
+	TwoTeams = {
+		Id = "TwoTeams",
+		DisplayName = "2 Teams",
+		Tagline = "Red vs Blue",
+		UsesTeams = true,
+		Teams = { "Red", "Blue" },
+		TeamSpawns = true,
+	},
+	FourTeams = {
+		Id = "FourTeams",
+		DisplayName = "4 Teams",
+		Tagline = "Four sides, one winner",
+		UsesTeams = true,
+		Teams = { "Red", "Blue", "Green", "Yellow" },
+		TeamSpawns = false,
+	},
+	FreeForAll = {
+		Id = "FreeForAll",
+		DisplayName = "Free For All",
+		Tagline = "Everyone for themselves",
+		UsesTeams = false,
+		Teams = {},
+		TeamSpawns = false,
+	},
+} :: { [string]: TeamMode }
+
+Match.TEAM_MODE_ORDER = { "TwoTeams", "FourTeams", "FreeForAll" } :: { TeamModeId }
 
 Match.TEAMS = {
 	Red = {
@@ -141,9 +214,26 @@ Match.TEAMS = {
 		TeamBrickColor = BrickColor.new("Bright blue"),
 		Color = Color3.fromRGB(64, 132, 226),
 	},
+	Green = {
+		Id = "Green",
+		DisplayName = "GREEN",
+		TeamBrickColor = BrickColor.new("Bright green"),
+		Color = Color3.fromRGB(72, 196, 104),
+	},
+	Yellow = {
+		Id = "Yellow",
+		DisplayName = "YELLOW",
+		TeamBrickColor = BrickColor.new("Bright yellow"),
+		Color = Color3.fromRGB(236, 196, 52),
+	},
 } :: { [string]: TeamDefinition }
 
-Match.TEAM_ORDER = { "Red", "Blue" } :: { TeamId }
+--[[
+	Every team that exists in ANY mode. Used for what has to exist all the
+	time (the Team instances, the score keys, the authored buttons). Which of
+	them a round actually plays with is the mode's Teams list, never this.
+]]
+Match.TEAM_ORDER = { "Red", "Blue", "Green", "Yellow" } :: { TeamId }
 
 --[[
 	True if `to` is reachable from `from` in one step. Same-state is allowed
@@ -169,17 +259,26 @@ function Match.isState(value: any): boolean
 	return type(value) == "string" and table.find(Match.STATES, value :: MatchState) ~= nil
 end
 
-function Match.isModeId(value: any): boolean
-	return type(value) == "string" and Match.MODES[value] ~= nil
+function Match.isGameModeId(value: any): boolean
+	return type(value) == "string" and Match.GAME_MODES[value] ~= nil
 end
 
+function Match.isTeamModeId(value: any): boolean
+	return type(value) == "string" and Match.TEAM_MODES[value] ~= nil
+end
+
+--[[
+	A team that exists at all. NOT enough to accept a team from a client:
+	Green is a real team, and it still does not exist in a two-team round.
+	Use modeHasTeam for that.
+]]
 function Match.isTeamId(value: any): boolean
 	return type(value) == "string" and Match.TEAMS[value] ~= nil
 end
 
---[[ The other team. Total over TeamId, so no caller writes the `if` itself. ]]
-function Match.opposingTeam(team: TeamId): TeamId
-	return if team == "Red" then "Blue" else "Red"
+-- Whether `value` is one of the sides `mode` plays with.
+function Match.modeHasTeam(mode: TeamMode, value: any): boolean
+	return type(value) == "string" and table.find(mode.Teams, value :: TeamId) ~= nil
 end
 
 --[[
@@ -199,21 +298,24 @@ end
 	Shape (RoundService is the ONLY writer):
 
 		State         MatchState
-		ModeId        GameModeId
+		GameModeId    GameModeId, the ruleset (sets the code length)
+		TeamModeId    TeamModeId
 		MapId         string, "" while no map is loaded
 		PhaseEndsAt   absolute workspace:GetServerTimeNow(), or 0 when the
 		              current phase has no deadline. Absolute, NOT a countdown:
 		              a remaining-seconds field would need a packet per second
 		              and would still drift. Every client subtracts its own
 		              GetServerTimeNow(), which Roblox keeps synchronised.
-		Scores        { Red: number, Blue: number }
+		Scores        { [TeamId]: number }, every team in TEAM_ORDER, 0 for
+		              teams the current mode does not play with
 		Vote          { MapChoices: {string}, MapVotes: {[string]: number},
-		                ModeVotes: {[string]: number} }
+		                GameModeVotes: {[string]: number},
+		                TeamModeVotes: {[string]: number} }
 		Players       { [playerKey]: RoundPlayer }
 
 	PUBLIC means public: everything here reaches every client, so nothing that
-	must stay secret may be added to it. Four-digit codes are NOT in this table
-	-- see CodeService.
+	must stay secret may be added to it. Kill codes are NOT in this table -- see
+	CodeService.
 ]]
 Match.REPLICA_TOKEN = "MatchState"
 

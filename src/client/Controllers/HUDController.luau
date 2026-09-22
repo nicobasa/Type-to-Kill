@@ -62,10 +62,11 @@ local TOAST_HOLD = 1.5
 local MAX_PENDING = 4
 
 --[[
-	Config.Modes has fixed fields (TeamDeathmatch, FreeForAll), so indexing it
-	with a mode id read off the replica is a --!strict error even though that
-	is exactly the shape the round hands us. One narrow, documented cast at
-	that boundary beats keeping a second copy of the kill goals in this file.
+	Config.TeamModes has fixed fields (TwoTeams, FourTeams, FreeForAll), so
+	indexing it with a mode id read off the replica is a --!strict error even
+	though that is exactly the shape the round hands us. One narrow, documented
+	cast at that boundary beats keeping a second copy of the kill goals in this
+	file.
 
 	Through `any`, and that step is not decoration: a sealed table of named
 	fields and a string-indexed map are unrelated types to Luau, so the direct
@@ -73,7 +74,7 @@ local MAX_PENDING = 4
 	on this line -- the annotated local is what every read below goes through,
 	so nothing downstream inherits it.
 ]]
-local MODE_CONFIG: { [string]: { KillGoal: number } } = Config.Modes :: any
+local MODE_CONFIG: { [string]: { KillGoal: number } } = Config.TeamModes :: any
 
 -- Net.notice's `kind` picks the colour; the wording and the styling are ours
 -- (Net.luau, notice).
@@ -94,7 +95,7 @@ local NOTICE_COLORS: { [string]: Color3 } = {
 local REJECTION_TEXT: { [string]: string } = {
 	RoundInactive = "NO ROUND IN PROGRESS",
 	NotPlaying = "NOT IN PLAY",
-	BadCode = `CODES ARE {Config.Code.Digits} DIGITS`,
+	Stunned = "YOU ARE STUNNED",
 	NoSuchCode = "NO SUCH CODE",
 	Self = "THAT IS YOUR OWN CODE",
 	Friendly = "THAT IS A TEAMMATE",
@@ -120,13 +121,20 @@ type CodeResult = {
 	experience: number,
 }
 
+-- One team's score box: TopBar/TeamScores/<TeamId>Score.
+type TeamRow = {
+	frame: GuiObject,
+	name: TextLabel,
+	value: TextLabel,
+}
+
 type Hud = {
 	timer: TextLabel,
 	teamScores: GuiObject,
-	redName: TextLabel,
-	redValue: TextLabel,
-	blueName: TextLabel,
-	blueValue: TextLabel,
+	-- Every team whose box is authored. Red and Blue are required; Green and
+	-- Yellow only matter in a four-team round, so a HUD without them still
+	-- binds and only those two scores go missing.
+	teamRows: { [string]: TeamRow },
 	soloScores: GuiObject,
 	youName: TextLabel,
 	youValue: TextLabel,
@@ -526,16 +534,27 @@ local function refreshScores()
 		return
 	end
 
-	local mode = MODE_CONFIG[MatchController.getModeId()]
-	local goal = if mode ~= nil then mode.KillGoal else 0
+	local teamMode = MatchController.getTeamMode()
+	local modeConfig = MODE_CONFIG[teamMode.Id]
+	local goal = if modeConfig ~= nil then modeConfig.KillGoal else 0
 
 	if usesTeams then
+		-- Only the round's own sides are shown: Green and Yellow boxes in a
+		-- two-team round would be two scores stuck at zero forever.
+		for teamId, row in hud.teamRows do
+			row.frame.Visible = Match.modeHasTeam(teamMode, teamId)
+		end
+
 		local scores = round.Scores
 		if scores == nil then
 			return
 		end
-		hud.redValue.Text = withGoal(count(scores.Red), goal)
-		hud.blueValue.Text = withGoal(count(scores.Blue), goal)
+		for _, teamId in teamMode.Teams do
+			local row = hud.teamRows[teamId]
+			if row ~= nil then
+				row.value.Text = withGoal(count(scores[teamId]), goal)
+			end
+		end
 		return
 	end
 
@@ -638,8 +657,16 @@ end
 
 local function onCodeResult(data: CodeResult)
 	if not data.accepted then
-		local text = REJECTION_TEXT[data.reason]
-		if text == nil then
+		local text: string
+		local mapped: string? = REJECTION_TEXT[data.reason]
+		if data.reason == "BadCode" then
+			-- Built here, not in REJECTION_TEXT: the length is the round's
+			-- ruleset and changes between rounds, and a table built at load
+			-- would say "4 DIGITS" through an entire Extreme round.
+			text = `CODES ARE {MatchController.getCodeDigits()} DIGITS`
+		elseif mapped ~= nil then
+			text = mapped
+		else
 			-- A tag this build does not know about. Say something true rather
 			-- than print a wire tag at the player.
 			log.debug(`unmapped codeResult reason "{data.reason}"`)
@@ -690,10 +717,30 @@ local function bind(gui: ScreenGui): Hud?
 
 	local timer = need("TopBar/TimerHolder/TimerLabel", "TextLabel")
 	local teamScores = need("TopBar/TeamScores", "GuiObject")
-	local redName = need("TopBar/TeamScores/RedScore/NameLabel", "TextLabel")
-	local redValue = need("TopBar/TeamScores/RedScore/ValueLabel", "TextLabel")
-	local blueName = need("TopBar/TeamScores/BlueScore/NameLabel", "TextLabel")
-	local blueValue = need("TopBar/TeamScores/BlueScore/ValueLabel", "TextLabel")
+
+	--[[
+		A team's box, or nil. Red and Blue go through need() -- every team mode
+		uses them, so a HUD without them is not the authored HUD. Green and
+		Yellow are looked up quietly: only a four-team round needs them.
+	]]
+	local teamRows: { [string]: TeamRow } = {}
+	for _, teamId in Match.TEAM_ORDER do
+		local required = teamId == "Red" or teamId == "Blue"
+		local base = `TopBar/TeamScores/{teamId}Score`
+		local frame = if required then need(base, "GuiObject") else resolve(root, base)
+		local name = if required then need(`{base}/NameLabel`, "TextLabel") else resolve(root, `{base}/NameLabel`)
+		local value = if required then need(`{base}/ValueLabel`, "TextLabel") else resolve(root, `{base}/ValueLabel`)
+		if
+			frame ~= nil
+			and frame:IsA("GuiObject")
+			and name ~= nil
+			and name:IsA("TextLabel")
+			and value ~= nil
+			and value:IsA("TextLabel")
+		then
+			teamRows[teamId] = { frame = frame, name = name, value = value }
+		end
+	end
 	local soloScores = need("TopBar/SoloScores", "GuiObject")
 	local youName = need("TopBar/SoloScores/YouScore/NameLabel", "TextLabel")
 	local youValue = need("TopBar/SoloScores/YouScore/ValueLabel", "TextLabel")
@@ -724,10 +771,7 @@ local function bind(gui: ScreenGui): Hud?
 	local hud: Hud = {
 		timer = timer :: TextLabel,
 		teamScores = teamScores :: GuiObject,
-		redName = redName :: TextLabel,
-		redValue = redValue :: TextLabel,
-		blueName = blueName :: TextLabel,
-		blueValue = blueValue :: TextLabel,
+		teamRows = teamRows,
 		soloScores = soloScores :: GuiObject,
 		youName = youName :: TextLabel,
 		youValue = youValue :: TextLabel,
@@ -746,11 +790,12 @@ local function bind(gui: ScreenGui): Hud?
 	-- Constant text, written once per bind. Both the word and the hue come
 	-- from Match.TEAMS so there is one source for each -- and the word is set
 	-- as well as the colour because roughly one player in twelve cannot
-	-- separate these two hues reliably (Match.luau, TeamDefinition).
-	hud.redName.Text = Match.TEAMS.Red.DisplayName
-	hud.redName.TextColor3 = Match.TEAMS.Red.Color
-	hud.blueName.Text = Match.TEAMS.Blue.DisplayName
-	hud.blueName.TextColor3 = Match.TEAMS.Blue.Color
+	-- separate red from green reliably (Match.luau, TeamDefinition).
+	for teamId, row in teamRows do
+		local definition = Match.TEAMS[teamId]
+		row.name.Text = definition.DisplayName
+		row.name.TextColor3 = definition.Color
+	end
 	hud.youName.Text = "YOU"
 
 	return hud
@@ -847,7 +892,7 @@ function HUDController.Start()
 		and the roster, and recomputing the block is cheaper than reasoning
 		about which half a given write touched.
 	]]
-	MatchController.observe({ "ModeId" }, refreshScores)
+	MatchController.observe({ "TeamModeId" }, refreshScores)
 	MatchController.observe({ "Scores" }, refreshScores)
 	MatchController.observe({ "Players" }, refreshScores)
 

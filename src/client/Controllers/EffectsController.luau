@@ -1,7 +1,7 @@
 --!strict
 --[[
-	Full-screen effects the client owns. Today that is exactly one: the
-	flashbang blind.
+	Full-screen effects the client owns: the flashbang blind, and the frag's
+	STUNNED indicator.
 
 	WHY THE VIEW CONE IS TESTED HERE AND NOT ON THE SERVER
 
@@ -30,13 +30,18 @@
 	opening the Settings menu would close the blind -- which is both a bug and
 	a free counter to a grenade.
 
+	The stun indicator is built here for the same reason. A player frozen by a
+	frag who opened Settings must not make the warning go away, and nothing
+	authored should be able to draw over it.
+
 	There is no per-character or per-round state below to leak: one ScreenGui
-	for the session, at most one pending hold and one tween, each replaced
-	rather than accumulated.
+	per effect for the session, at most one pending hold and one tween, each
+	replaced rather than accumulated.
 ]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local Config = require(ReplicatedStorage.Shared.Config)
@@ -95,6 +100,29 @@ type Overlay = {
 	gui: ScreenGui,
 	fill: Frame,
 }
+
+--[[
+	One below the flash, so a flashbang landing during a stun still whites
+	everything out, and above every authored screen for the reason
+	FLASH_DISPLAY_ORDER gives.
+]]
+local STUN_DISPLAY_ORDER = FLASH_DISPLAY_ORDER - 1
+-- The stun effect's yellow (GrenadeService), so the frozen player and the
+-- people looking at them see the same colour mean the same thing.
+local STUN_COLOR = Color3.fromRGB(255, 221, 64)
+
+type StunOverlay = {
+	gui: ScreenGui,
+	label: TextLabel,
+}
+
+--[[
+	The shock's warning: the same shape as the stun's, in the shock grenade's
+	electric blue, one DisplayOrder below it and with its label just under the
+	stun's, so a player both stunned and shocked reads both.
+]]
+local SHOCK_DISPLAY_ORDER = STUN_DISPLAY_ORDER - 1
+local SHOCK_COLOR = Color3.fromRGB(90, 190, 255)
 
 local EffectsController = {}
 
@@ -272,6 +300,220 @@ local function shouldBlind(position: Vector3, closeRange: boolean): boolean
 	return eye.LookVector:Dot(offset / distance) >= HALF_CONE_COSINE
 end
 
+local stunOverlay: StunOverlay? = nil
+-- Server time the current stun ends, and the loop counting down to it.
+local stunEndsAt = 0
+local stunConnection: RBXScriptConnection? = nil
+
+--[[
+	This controller is the client's one answer to "am I stunned?", because it
+	is the one that hears Net.stunned and Net.killed. TypeModeController asks
+	here rather than tracking its own copy, so the countdown on screen and the
+	locked keypad cannot disagree about when the stun ends.
+]]
+local stunListeners: { (stunned: boolean) -> () } = {}
+local stunned = false
+
+local function setStunned(value: boolean)
+	if stunned == value then
+		return
+	end
+	stunned = value
+	for _, listener in stunListeners do
+		task.spawn(listener, value)
+	end
+end
+
+--[[
+	A coloured edge around the whole screen with a countdown label: the stun's
+	and the shock's warning. The player can still see the fight, which is the
+	point, but cannot miss the effect.
+]]
+local function buildTimedOverlay(
+	parent: Instance,
+	name: string,
+	color: Color3,
+	displayOrder: number,
+	labelY: number
+): StunOverlay
+	local gui = Instance.new("ScreenGui")
+	gui.Name = name
+	gui.DisplayOrder = displayOrder
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.Enabled = false
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Edge"
+	frame.Size = UDim2.fromScale(1, 1)
+	frame.BackgroundTransparency = 1
+	frame.Active = false
+	frame.Parent = gui
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color
+	stroke.Thickness = 10
+	stroke.Transparency = 0.25
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = frame
+
+	-- Below the crosshair, above the toolbar: where the eye already is, not
+	-- over the thing the player is trying to read.
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.AnchorPoint = Vector2.new(0.5, 0.5)
+	label.Position = UDim2.fromScale(0.5, labelY)
+	label.Size = UDim2.fromScale(0.3, 0.05)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBlack
+	label.TextScaled = true
+	label.TextColor3 = color
+	label.TextStrokeTransparency = 0.4
+	label.Text = ""
+	label.Parent = gui
+
+	gui.Parent = parent
+	return { gui = gui, label = label }
+end
+
+-- Same shape and the same ResetOnSpawn reasoning as ensureOverlay.
+local function ensureStunOverlay(): StunOverlay?
+	local parent = playerGui
+	if parent == nil then
+		return nil
+	end
+
+	local current = stunOverlay
+	if current ~= nil and current.gui.Parent == parent then
+		return current
+	end
+	if current ~= nil then
+		current.gui:Destroy()
+	end
+
+	local built = buildTimedOverlay(parent, "StunOverlay", STUN_COLOR, STUN_DISPLAY_ORDER, 0.64)
+	stunOverlay = built
+	return built
+end
+
+local function stopStun()
+	local connection = stunConnection
+	stunConnection = nil
+	if connection ~= nil then
+		connection:Disconnect()
+	end
+	local current = stunOverlay
+	if current ~= nil then
+		current.gui.Enabled = false
+	end
+	setStunned(false)
+end
+
+local function playStun(endsAt: number)
+	-- NaN passes every comparison below and would pin the overlay up forever
+	-- (quality-gate trap #8).
+	if endsAt ~= endsAt then
+		return
+	end
+	-- Restarted, not added to: a second frag resets the stun to its full
+	-- length on the server (SprintService.stun), and the countdown follows.
+	stunEndsAt = endsAt
+	setStunned(true)
+
+	local target = ensureStunOverlay()
+	if target == nil then
+		return
+	end
+	target.gui.Enabled = true
+
+	if stunConnection ~= nil then
+		return
+	end
+	stunConnection = RunService.Heartbeat:Connect(function()
+		local remaining = stunEndsAt - Workspace:GetServerTimeNow()
+		if remaining <= 0 then
+			stunEndsAt = 0
+			stopStun()
+			return
+		end
+		target.label.Text = string.format("STUNNED %.1f", remaining)
+	end)
+end
+
+local shockOverlay: StunOverlay? = nil
+local shockEndsAt = 0
+local shockConnection: RBXScriptConnection? = nil
+
+local function ensureShockOverlay(): StunOverlay?
+	local parent = playerGui
+	if parent == nil then
+		return nil
+	end
+
+	local current = shockOverlay
+	if current ~= nil and current.gui.Parent == parent then
+		return current
+	end
+	if current ~= nil then
+		current.gui:Destroy()
+	end
+
+	local built = buildTimedOverlay(parent, "ShockOverlay", SHOCK_COLOR, SHOCK_DISPLAY_ORDER, 0.69)
+	shockOverlay = built
+	return built
+end
+
+local function stopShock()
+	shockEndsAt = 0
+	local connection = shockConnection
+	shockConnection = nil
+	if connection ~= nil then
+		connection:Disconnect()
+	end
+	local current = shockOverlay
+	if current ~= nil then
+		current.gui.Enabled = false
+	end
+end
+
+-- The shock's countdown, restarted (not extended) by a second shock, like
+-- the stun's -- SprintService.slow restarts the slow the same way.
+local function playShock(endsAt: number)
+	if endsAt ~= endsAt then
+		return
+	end
+	shockEndsAt = endsAt
+
+	local target = ensureShockOverlay()
+	if target == nil then
+		return
+	end
+	target.gui.Enabled = true
+
+	if shockConnection ~= nil then
+		return
+	end
+	shockConnection = RunService.Heartbeat:Connect(function()
+		local remaining = shockEndsAt - Workspace:GetServerTimeNow()
+		if remaining <= 0 then
+			stopShock()
+			return
+		end
+		target.label.Text = string.format("SHOCKED -- NO SPRINT %.1f", remaining)
+	end)
+end
+
+function EffectsController.isStunned(): boolean
+	return stunned
+end
+
+-- Fires with true when a stun starts and false when it ends or the player
+-- dies. Not on a restart: a second frag keeps you stunned, it does not
+-- un-stun you in between.
+function EffectsController.onStunChanged(listener: (stunned: boolean) -> ())
+	table.insert(stunListeners, listener)
+end
+
 function EffectsController.Init()
 	--[[
 		Registered in Init, not Start. A grenade already in the air when we join
@@ -285,6 +527,23 @@ function EffectsController.Init()
 			return
 		end
 		playFlash()
+	end)
+
+	-- Init for the same reason as the flash: a frag can go off before this
+	-- client's Start has run.
+	Net.stunned.listen(function(data)
+		playStun(data.endsAt)
+	end)
+	Net.shocked.listen(function(data)
+		playShock(data.endsAt)
+	end)
+
+	-- Dying ends the stun and the shock with the body (SprintService resets
+	-- both on the next spawn), so neither warning may sit over the killcam.
+	Net.killed.listen(function()
+		stunEndsAt = 0
+		stopStun()
+		stopShock()
 	end)
 end
 
@@ -312,6 +571,8 @@ function EffectsController.Start()
 	-- Creating and parenting a ScreenGui mid-blast costs the player frames of
 	-- clear vision from the effect meant to take it away.
 	ensureOverlay()
+	ensureStunOverlay()
+	ensureShockOverlay()
 end
 
 return EffectsController

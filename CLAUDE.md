@@ -78,6 +78,13 @@ construct UI trees in Luau that belong in StarterGui.
 - **Strict Luau.** `--!strict` everywhere. Avoid `any` — if a dependency's
   signature is wrong but the runtime contract is verified, use one narrow,
   commented cast at that call site rather than spreading `any` outward.
+- **Anything a player can own is editable from the admin panel.** A new
+  currency, inventory item, cosmetic or any other grantable value ships with
+  its admin control in the same change: an op in `AdminService.applyEdit`
+  (validated there, and so also applied to offline players) and a control in
+  `AdminController` / `Screens.Admin`. Catalog-driven lists (cases, titles)
+  pick up new entries on their own; a new field needs a new op. See
+  GAMEPLAY.md, "Admin panel".
 - **Prefer an installed package** over reimplementing it. Check `wally.toml`
   first; note that `wally.toml` also records libraries deliberately *rejected*
   and why, so read the comments before adding a dependency.
@@ -102,9 +109,15 @@ luau-lsp analyze --definitions=globalTypes.d.luau --sourcemap=sourcemap.json `
 diagnostic as yours:
 
 - *"Cyclic dependencies are only supported if all modules use 'export' syntax"* —
-  60 lines of it, and every one is the deferred-require pattern ARCHITECTURE.md
-  prescribes. It is correct at runtime (the annotation is erased); `luau-lsp`
-  cannot see that. This is the whole baseline.
+  every one is the deferred-require pattern ARCHITECTURE.md prescribes. It is
+  correct at runtime (the annotation is erased); `luau-lsp` cannot see that.
+  This is the whole baseline. **Count distinct positions, not lines:** there
+  are 9 distinct `file(line,col)` positions, but `luau-lsp` repeats each one
+  once per module that depends on the cycle, so the line count (81 today)
+  grows whenever a module starts requiring something inside it (it went from
+  60 to 69 when GrenadeService started requiring SprintService, and to 81 with
+  AdminService). A 10th distinct
+  position is a real new cycle.
 - Anything under `src/vendor/` is excluded by `--ignore`, as it is in
   `selene.toml` and `.styluaignore`.
 
@@ -114,6 +127,13 @@ Quick check that you added nothing:
 luau-lsp analyze --definitions=globalTypes.d.luau --sourcemap=sourcemap.json `
   --base-luaurc=.luaurc --ignore="src/vendor/**" src/ |
   Select-String -NotMatch "Cyclic dependencies"   # expect no output
+```
+
+And that the cycles are still the same 9:
+
+```bash
+luau-lsp analyze ... src/ 2>&1 | grep Cyclic |
+  sed 's/.*\[\(game[^]]*\)\](\([0-9,]*\)).*/\1 \2/' | sort -u | wc -l   # expect 9
 ```
 
 Two traps worth knowing before you "fix" a diagnostic, both of which cost real
@@ -129,7 +149,7 @@ time to learn:
   reaches every reader as plain `string`, and assigning from an annotated local
   does not help either. Both were measured. What works is declaring the field
   inside the table constructor (`local Match = { X = "A" :: SomeUnion }`),
-  which keeps its type. `Match.DEFAULT_MODE` is written that way for this
+  which keeps its type. `Match.DEFAULT_GAME_MODE` and `DEFAULT_TEAM_MODE` are written that way for this
   reason. Array casts (`:: { T }`) are not affected.
 
 Write build artifacts to the temp dir, never into the repo. This is a Windows
