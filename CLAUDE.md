@@ -179,3 +179,11 @@ editor's Explorer and Problems panel. A `.luaurc` of
 `{"languageMode": "nocheck", "lint": {"*": false}}` in `Packages/` and `ServerPackages/`
 also keeps a package file clean while it is open. `wally install` wipes those two
 `.luaurc` files, so recreate them afterwards if you want that. Rojo ignores them.
+
+<!-- skill-vault:start -->
+## Studio Skill Vault
+
+**Do this first.** If `.claude/skills/skill-vault/SKILL.md` is missing, run `python .claude/hooks/skillvault.py` before any other work. If it says the vault was not found, stop and ask the developer where their SkillVault folder is, then run `python .claude/hooks/skillvault.py --vault "<path>"`. That saves the path for this project, so do not ask again.
+
+Shared skills, roles and standards come from the vault and are linked into `.claude/` when a session starts. This project's own instructions and its own skills win any conflict. Replace a vault skill by giving this project a real folder of that name. Use the `skill-vault` skill to find shared knowledge, look up API key names, or save a reusable technique.
+<!-- skill-vault:end -->
